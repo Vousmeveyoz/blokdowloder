@@ -5,12 +5,14 @@ Applies subtle audio modifications so the output isn't identical to the original
 All processing is done via ffmpeg filters — no extra Python audio libs needed.
 
 ═══════════════════════════════════════════════════════════════════════════════
-MODIFICATION LAYERS (10 total):
+MODIFICATION LAYERS (12 total):
 ═══════════════════════════════════════════════════════════════════════════════
 
 Layer 1 — Audio Tweaks:
   - Pitch shift        : ±0.5–2 semitones
   - Tempo change       : ±1–5% speed adjustment
+  - Speed 2.3x         : aggressive speed-up via chained atempo (2.0 × 1.15)
+  - Amplify            : volume adjustment in dB (e.g. -8dB)
   - Bass/Treble EQ     : slight boost/cut
   - Stereo widening    : subtle width adjustment
   - Layered EQ         : multi-band micro-nudges across spectrum
@@ -32,7 +34,7 @@ import subprocess
 import shutil
 import tempfile
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -52,6 +54,17 @@ class ModificationProfile:
     # ── Layer 1: Audio Tweaks ──
     pitch_semitones: float | None = None
     speed_factor: float | None = None
+
+    # Speed 2.3x: aggressive speed-up using chained atempo filters
+    # ffmpeg atempo max is 2.0, so 2.3x = atempo=2.0,atempo=1.15
+    # Set to True to enable, None/False to skip
+    speed_2x: bool | None = None
+
+    # Amplify: volume adjustment in dB
+    # Negative = reduce volume (e.g. -8.0 = quieter)
+    # Positive = boost volume (e.g. +3.0 = louder)
+    amplify_db: float | None = None
+
     bass_db: float | None = None
     treble_db: float | None = None
     stereo_width: float | None = None
@@ -59,21 +72,11 @@ class ModificationProfile:
     eq_layers: list[tuple[float, float, float]] | None = None
 
     # ── Layer 2: Fingerprint Removal ──
-    # Strip all metadata from output (ID3, encoder, comments, etc)
     strip_metadata: bool = True
-
-    # Low-pass cutoff frequency to remove high-freq watermarks
-    # None = skip, typical value: 17500–18500 Hz
-    # Human hearing tops out ~18kHz, watermarks often hide above that
     watermark_cutoff_hz: int | None = None
 
     # ── Layer 3: Human-Like Imperfections ──
-    # Micro-dynamics: subtle volume fluctuation via tremolo
-    # (rate_hz, depth_percent) — e.g. (0.3, 1.5) = 0.3Hz wobble, 1.5% depth
     micro_dynamics: tuple[float, float] | None = None
-
-    # Phase jitter: tiny delay on one channel (in milliseconds)
-    # Breaks perfect digital stereo symmetry. Range: 0.1–0.8ms
     phase_jitter_ms: float | None = None
 
     @classmethod
@@ -88,6 +91,7 @@ class ModificationProfile:
             "subtle": {
                 "pitch": (-0.7, 0.7),
                 "speed": (0.98, 1.02),
+                "amplify": (-2.0, 2.0),
                 "bass": (-1.5, 1.5),
                 "treble": (-1.5, 1.5),
                 "stereo": (0.9, 1.1),
@@ -98,10 +102,12 @@ class ModificationProfile:
                 "dynamics_rate": (0.15, 0.5),
                 "dynamics_depth": (0.5, 2.0),
                 "phase_jitter": (0.1, 0.4),
+                "speed_2x_chance": 0.0,   # off for subtle
             },
             "moderate": {
                 "pitch": (-1.5, 1.5),
                 "speed": (0.96, 1.04),
+                "amplify": (-5.0, 3.0),
                 "bass": (-3.0, 3.0),
                 "treble": (-3.0, 3.0),
                 "stereo": (0.8, 1.2),
@@ -112,10 +118,12 @@ class ModificationProfile:
                 "dynamics_rate": (0.2, 0.8),
                 "dynamics_depth": (1.0, 3.5),
                 "phase_jitter": (0.2, 0.6),
+                "speed_2x_chance": 0.3,   # 30% chance
             },
             "strong": {
                 "pitch": (-2.0, 2.0),
                 "speed": (0.93, 1.07),
+                "amplify": (-8.0, 5.0),
                 "bass": (-5.0, 5.0),
                 "treble": (-5.0, 5.0),
                 "stereo": (0.7, 1.3),
@@ -126,19 +134,18 @@ class ModificationProfile:
                 "dynamics_rate": (0.3, 1.2),
                 "dynamics_depth": (2.0, 5.0),
                 "phase_jitter": (0.3, 0.8),
+                "speed_2x_chance": 0.6,   # 60% chance
             },
         }
 
         p = presets.get(intensity, presets["subtle"])
 
-        # ── Pick random Layer 1 mods (3–5 of 7) ──
-        layer1_mods = ["pitch", "speed", "bass", "treble", "stereo", "cuts", "eq_layers"]
-        chosen_l1 = random.sample(layer1_mods, k=random.randint(3, min(5, len(layer1_mods))))
+        layer1_mods = ["pitch", "speed", "amplify", "bass", "treble", "stereo", "cuts", "eq_layers"]
+        chosen_l1 = random.sample(layer1_mods, k=random.randint(3, min(6, len(layer1_mods))))
 
-        # ── Layer 2: always strip metadata, randomly enable watermark cut ──
-        enable_watermark = random.random() < 0.7  # 70% chance
+        enable_watermark = random.random() < 0.7
+        enable_speed_2x  = random.random() < p["speed_2x_chance"]
 
-        # ── Layer 3: pick 1–2 imperfections ──
         layer3_mods = ["dynamics", "phase_jitter"]
         chosen_l3 = random.sample(layer3_mods, k=random.randint(1, 2))
 
@@ -161,21 +168,28 @@ class ModificationProfile:
                 bandwidth = round(freq * random.uniform(0.3, 0.8), 1)
                 eq_layers.append((round(freq, 1), gain, bandwidth))
 
-        # Generate micro-dynamics
         micro_dynamics = None
         if "dynamics" in chosen_l3:
             rate = round(random.uniform(*p["dynamics_rate"]), 2)
             depth = round(random.uniform(*p["dynamics_depth"]), 2)
             micro_dynamics = (rate, depth)
 
+        # If speed_2x is on, skip regular speed_factor to avoid conflict
+        speed_factor = None
+        if "speed" in chosen_l1 and not enable_speed_2x:
+            speed_factor = round(random.uniform(*p["speed"]), 4)
+
+        amplify_db = None
+        if "amplify" in chosen_l1:
+            amplify_db = round(random.uniform(*p["amplify"]), 1)
+
         return cls(
-            # Layer 1
             pitch_semitones=(
                 round(random.uniform(*p["pitch"]), 2) if "pitch" in chosen_l1 else None
             ),
-            speed_factor=(
-                round(random.uniform(*p["speed"]), 4) if "speed" in chosen_l1 else None
-            ),
+            speed_factor=speed_factor,
+            speed_2x=True if enable_speed_2x else None,
+            amplify_db=amplify_db,
             bass_db=(
                 round(random.uniform(*p["bass"]), 1) if "bass" in chosen_l1 else None
             ),
@@ -189,12 +203,10 @@ class ModificationProfile:
                 random.randint(*p["cuts"]) if "cuts" in chosen_l1 else None
             ),
             eq_layers=eq_layers,
-            # Layer 2
             strip_metadata=True,
             watermark_cutoff_hz=(
                 random.randint(*p["watermark_cutoff"]) if enable_watermark else None
             ),
-            # Layer 3
             micro_dynamics=micro_dynamics,
             phase_jitter_ms=(
                 round(random.uniform(*p["phase_jitter"]), 2)
@@ -214,6 +226,11 @@ class ModificationProfile:
             pct = (self.speed_factor - 1.0) * 100
             d = "↑" if pct > 0 else "↓"
             parts.append(f"Speed {d}{abs(pct):.1f}%")
+        if self.speed_2x:
+            parts.append("Speed 2.3x")
+        if self.amplify_db is not None:
+            s = "+" if self.amplify_db > 0 else ""
+            parts.append(f"Amplify {s}{self.amplify_db:.1f}dB")
         if self.bass_db is not None:
             s = "+" if self.bass_db > 0 else ""
             parts.append(f"Bass {s}{self.bass_db:.1f}dB")
@@ -253,14 +270,21 @@ class AudioModifier:
     Applies multi-layer audio modifications using ffmpeg filters.
 
     Pipeline:
-      1. Audio tweaks (EQ, pitch, speed, stereo, layered EQ)
+      1. Audio tweaks (EQ, pitch, speed, stereo, layered EQ, amplify, speed_2x)
       2. Fingerprint removal (metadata strip, watermark low-pass)
       3. Human-like imperfections (micro-dynamics, phase jitter)
       4. Micro-cuts (tiny segment removal with smooth gap-fill)
 
-    Usage:
-        modifier = AudioModifier()
-        output = modifier.modify("input.mp3", "output.ogg")
+    Notes on speed_2x:
+      ffmpeg atempo filter only supports range 0.5–2.0.
+      To achieve 2.3x speed, we chain two atempo filters:
+        atempo=2.0,atempo=1.15  →  2.0 × 1.15 = 2.3x
+      This is applied AFTER pitch shift (if any) so pitch stays independent.
+
+    Notes on amplify_db:
+      Uses ffmpeg volume filter: volume=<value>dB
+      -8dB ≈ roughly half perceived loudness.
+      Applied early in chain so subsequent filters work on adjusted level.
     """
 
     def __init__(self):
@@ -272,7 +296,6 @@ class AudioModifier:
     # ── Helpers ──────────────────────────────────────────────────────────
 
     def _get_duration(self, filepath: str) -> float:
-        """Get audio duration in seconds using ffprobe."""
         cmd = [
             "ffprobe", "-v", "quiet",
             "-print_format", "json",
@@ -284,7 +307,6 @@ class AudioModifier:
         return float(info["format"]["duration"])
 
     def _get_channels(self, filepath: str) -> int:
-        """Get number of audio channels using ffprobe."""
         cmd = [
             "ffprobe", "-v", "quiet",
             "-print_format", "json",
@@ -299,7 +321,6 @@ class AudioModifier:
         return 2
 
     def _run_ffmpeg(self, command: list[str]) -> None:
-        """Run an ffmpeg command, raising RuntimeError on failure."""
         try:
             subprocess.run(
                 command, check=True,
@@ -316,22 +337,27 @@ class AudioModifier:
         Build the complete ffmpeg -af filter chain.
 
         Order (optimized for quality):
-          1. Watermark removal (low-pass) — kill hidden high-freq markers first
-          2. Layered EQ nudges
-          3. Bass/treble broad EQ
-          4. Micro-dynamics (tremolo)
-          5. Pitch shift (asetrate + aresample)
-          6. Speed change (atempo)
-          7. Stereo widening (extrastereo) — stereo only
-          8. Phase jitter (adelay on one channel) — stereo only
+          1. Watermark removal (low-pass)
+          2. Amplify / volume adjustment   ← NEW
+          3. Layered EQ nudges
+          4. Bass/treble broad EQ
+          5. Micro-dynamics (tremolo)
+          6. Pitch shift (asetrate + aresample)
+          7. Speed change (atempo ±5%)
+          8. Speed 2.3x (atempo=2.0,atempo=1.15) ← NEW
+          9. Stereo widening (extrastereo)
+         10. Phase jitter (adelay)
         """
         filters = []
 
         # ── Layer 2: Watermark removal ──
         if profile.watermark_cutoff_hz is not None:
-            filters.append(
-                f"lowpass=f={profile.watermark_cutoff_hz}:p=2"
-            )
+            filters.append(f"lowpass=f={profile.watermark_cutoff_hz}:p=2")
+
+        # ── Layer 1: Amplify ──
+        # Applied early so all subsequent filters work on adjusted level
+        if profile.amplify_db is not None and profile.amplify_db != 0:
+            filters.append(f"volume={profile.amplify_db}dB")
 
         # ── Layer 1: Layered EQ tweaks ──
         if profile.eq_layers:
@@ -358,10 +384,18 @@ class AudioModifier:
             filters.append(f"asetrate={new_rate}")
             filters.append("aresample=44100")
 
-        # ── Layer 1: Speed ──
-        if profile.speed_factor is not None and profile.speed_factor != 1.0:
+        # ── Layer 1: Speed (±5% subtle change) ──
+        # Note: skip if speed_2x is active to avoid double speed change
+        if profile.speed_factor is not None and profile.speed_factor != 1.0 and not profile.speed_2x:
             factor = max(0.5, min(2.0, profile.speed_factor))
             filters.append(f"atempo={factor}")
+
+        # ── Layer 1: Speed 2.3x ──
+        # ffmpeg atempo max = 2.0, so chain: atempo=2.0,atempo=1.15 → 2.3x
+        # Applied AFTER pitch shift so pitch stays consistent
+        if profile.speed_2x:
+            filters.append("atempo=2.0")
+            filters.append("atempo=1.15")
 
         # ── Layer 1: Stereo widening (stereo only) ──
         if channels >= 2:
@@ -370,22 +404,13 @@ class AudioModifier:
 
         # ── Layer 3: Phase jitter (stereo only) ──
         if channels >= 2 and profile.phase_jitter_ms is not None:
-            delay_ms = profile.phase_jitter_ms
-            filters.append(f"adelay={delay_ms}|0")
+            filters.append(f"adelay={profile.phase_jitter_ms}|0")
 
         return ",".join(filters)
 
     # ── Micro-cuts ──────────────────────────────────────────────────────
 
-    def _generate_cut_points(
-        self, duration: float, num_cuts: int
-    ) -> list[tuple[float, float]]:
-        """
-        Generate random micro-cut positions.
-
-        Each cut removes 10–50ms. Avoids first/last 2 seconds.
-        Cuts are non-overlapping with a 20ms safety buffer.
-        """
+    def _generate_cut_points(self, duration: float, num_cuts: int) -> list[tuple[float, float]]:
         if duration < 10:
             return []
 
@@ -428,12 +453,6 @@ class AudioModifier:
         codec: str = "libvorbis",
         quality: str = "4",
     ) -> str:
-        """
-        Remove tiny segments and smoothly close the gaps.
-
-        Uses aselect to exclude micro-ranges, then aresample async=1
-        to seamlessly fill gaps without clicks or pops.
-        """
         duration = self._get_duration(input_path)
         cuts = self._generate_cut_points(duration, num_cuts)
 
@@ -479,16 +498,15 @@ class AudioModifier:
 
         Full pipeline:
           Pass 1: All filter tweaks → intermediate WAV (lossless)
-                  - Watermark removal (low-pass)
+                  - Watermark removal
+                  - Amplify / volume
                   - EQ layers + bass/treble
-                  - Micro-dynamics (tremolo)
+                  - Micro-dynamics
                   - Pitch shift + speed change
+                  - Speed 2.3x (chained atempo)
                   - Stereo widening + phase jitter
                   - Metadata stripped
-          Pass 2: Micro-cuts → final OGG (only compression here)
-                  - Also strips metadata via -map_metadata -1
-
-        If no micro-cuts, single pass with metadata stripping.
+          Pass 2: Micro-cuts → final OGG
         """
         input_file = Path(input_path)
         if not input_file.exists():
@@ -503,7 +521,7 @@ class AudioModifier:
         has_cuts = profile.micro_cuts is not None and profile.micro_cuts > 0
         strip = profile.strip_metadata
 
-        # ── No modifications at all → plain convert + strip metadata ──
+        # ── No modifications → plain convert + strip metadata ──
         if not has_tweaks and not has_cuts:
             cmd = ["ffmpeg", "-i", str(input_file)]
             if strip:
@@ -518,7 +536,6 @@ class AudioModifier:
                 tmp_path = tmp.name
 
             try:
-                # Pass 1: all tweaks → lossless WAV
                 cmd1 = [
                     "ffmpeg", "-i", str(input_file),
                     "-af", filter_chain,
@@ -528,7 +545,6 @@ class AudioModifier:
                 ]
                 self._run_ffmpeg(cmd1)
 
-                # Pass 2: micro-cuts → final OGG
                 self._apply_micro_cuts(
                     tmp_path, str(output_path),
                     num_cuts=profile.micro_cuts,
