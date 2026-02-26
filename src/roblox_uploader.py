@@ -36,40 +36,124 @@ class RobloxUploader:
             "error": error,
         }
 
-    def _poll_operation(self, operation_id: str, max_wait: int = 120, interval: int = 5) -> dict:
+    def _poll_operation(
+        self,
+        operation_id: str,
+        max_wait: int = 86400,
+        interval: int = 15,
+    ) -> dict:
+        """
+        Poll operation endpoint until done=True (Approved/Rejected).
+
+        - interval: 15 detik antar poll (Roblox moderasi butuh 1-5 menit)
+        - max_wait: default 86400 (24 jam) — practically infinite
+        - Saat network error: skip + retry, TIDAK langsung return
+        - Hanya berhenti saat: done=True ATAU max_wait habis
+        """
         url = self.OPERATION_URL.format(operation_id=operation_id)
         elapsed = 0
+        consecutive_errors = 0
+        MAX_CONSECUTIVE_ERRORS = 10  # toleransi 10 error berturut-turut
 
         while elapsed < max_wait:
             try:
                 resp = requests.get(url, headers=self._headers(), timeout=30)
+                consecutive_errors = 0  # reset error counter on success
+
             except requests.exceptions.RequestException as e:
-                return {"done": False, "asset_id": None, "moderation_state": None, "moderation_note": None, "error": str(e)}
+                # Network error — jangan return, cukup skip dan coba lagi
+                consecutive_errors += 1
+                print(f"  [~] Network error ({consecutive_errors}), retry... ({elapsed}s)", end="\r", flush=True)
+
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                    return {
+                        "done": False,
+                        "asset_id": None,
+                        "moderation_state": self.MODERATION_REVIEWING,
+                        "moderation_note": None,
+                        "error": f"Gagal poll setelah {MAX_CONSECUTIVE_ERRORS} error berturut-turut: {e}",
+                    }
+
+                time.sleep(interval)
+                elapsed += interval
+                continue
 
             if resp.status_code != 200:
-                return {"done": False, "asset_id": None, "moderation_state": None, "moderation_note": None, "error": f"HTTP {resp.status_code}"}
+                # HTTP error — skip dan retry, bukan langsung return
+                consecutive_errors += 1
+                print(f"  [~] HTTP {resp.status_code}, retry... ({elapsed}s)", end="\r", flush=True)
 
-            data = resp.json()
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                    return {
+                        "done": False,
+                        "asset_id": None,
+                        "moderation_state": self.MODERATION_REVIEWING,
+                        "moderation_note": None,
+                        "error": f"HTTP {resp.status_code} terlalu sering.",
+                    }
+
+                time.sleep(interval)
+                elapsed += interval
+                continue
+
+            # Parse response
+            try:
+                data = resp.json()
+            except Exception:
+                time.sleep(interval)
+                elapsed += interval
+                continue
+
             if data.get("done", False):
+                # Moderasi selesai — ambil result
                 response_obj = data.get("response", {})
                 asset_id   = response_obj.get("assetId")
                 moderation = response_obj.get("moderationResult", {})
                 mod_state  = moderation.get("moderationState")
                 mod_note   = moderation.get("comment") or moderation.get("reason")
-                return {"done": True, "asset_id": str(asset_id) if asset_id else None, "moderation_state": mod_state, "moderation_note": mod_note, "error": None}
 
+                return {
+                    "done": True,
+                    "asset_id": str(asset_id) if asset_id else None,
+                    "moderation_state": mod_state,
+                    "moderation_note": mod_note,
+                    "error": None,
+                }
+
+            # done=False — belum selesai, tunggu lagi
             time.sleep(interval)
             elapsed += interval
-            print(f"  [~] Menunggu moderasi Roblox... ({elapsed}s)", end="\r", flush=True)
+            mins = elapsed // 60
+            secs = elapsed % 60
+            print(f"  [~] Menunggu moderasi Roblox... ({mins}m {secs}s)", end="\r", flush=True)
 
-        return {"done": False, "asset_id": None, "moderation_state": self.MODERATION_REVIEWING, "moderation_note": None, "error": f"Timeout {max_wait}s"}
+        # Max wait habis (24 jam) — sangat jarang terjadi
+        return {
+            "done": False,
+            "asset_id": None,
+            "moderation_state": self.MODERATION_REVIEWING,
+            "moderation_note": None,
+            "error": f"Timeout setelah {max_wait // 3600} jam. Cek di Creator Dashboard.",
+        }
 
-    def upload(self, filepath: str, display_name: str, description: str = "Uploaded via BLOKMARKET AUDIO", wait_moderation: bool = True, moderation_timeout: int = 120) -> dict:
+    def upload(
+        self,
+        filepath: str,
+        display_name: str,
+        description: str = "Uploaded via BLOKMARKET AUDIO",
+        wait_moderation: bool = True,
+        moderation_timeout: int = 86400,
+    ) -> dict:
         path = Path(filepath)
         if not path.exists():
             return self._fail(f"File tidak ditemukan: {filepath}")
 
-        content_type_map = {".ogg": "audio/ogg", ".mp3": "audio/mpeg", ".wav": "audio/wav", ".flac": "audio/flac"}
+        content_type_map = {
+            ".ogg": "audio/ogg",
+            ".mp3": "audio/mpeg",
+            ".wav": "audio/wav",
+            ".flac": "audio/flac",
+        }
         content_type = content_type_map.get(path.suffix.lower(), "audio/ogg")
 
         request_body = {
@@ -101,19 +185,29 @@ class RobloxUploader:
                 429: "Rate limit. Tunggu sebentar lalu coba lagi.",
                 500: "Server Roblox error. Coba lagi nanti.",
             }
-            return self._fail(error_map.get(response.status_code, f"HTTP {response.status_code}: {response.text[:200]}"))
+            return self._fail(error_map.get(
+                response.status_code,
+                f"HTTP {response.status_code}: {response.text[:200]}"
+            ))
 
         try:
             data = response.json()
         except Exception:
             return self._fail("Gagal parse response dari Roblox.")
 
-        # Check if assetId returned directly
+        # Kadang Roblox langsung return assetId (sudah done)
         direct_asset_id = data.get("assetId") or data.get("id")
         if direct_asset_id:
-            return {"success": True, "asset_id": str(direct_asset_id), "asset_url": f"rbxassetid://{direct_asset_id}", "moderation_state": self.MODERATION_APPROVED, "moderation_note": None, "error": None}
+            return {
+                "success": True,
+                "asset_id": str(direct_asset_id),
+                "asset_url": f"rbxassetid://{direct_asset_id}",
+                "moderation_state": self.MODERATION_APPROVED,
+                "moderation_note": None,
+                "error": None,
+            }
 
-        # Get operationId for polling
+        # Async operation — perlu polling
         operation_path = data.get("path", "")
         operation_id = operation_path.split("/")[-1] if operation_path else None
 
@@ -121,11 +215,19 @@ class RobloxUploader:
             return self._fail("Tidak dapat operationId dari response Roblox.")
 
         if not wait_moderation:
-            return {"success": True, "asset_id": None, "asset_url": None, "moderation_state": self.MODERATION_REVIEWING, "moderation_note": None, "error": None, "operation_id": operation_id}
+            return {
+                "success": True,
+                "asset_id": None,
+                "asset_url": None,
+                "moderation_state": self.MODERATION_REVIEWING,
+                "moderation_note": None,
+                "error": None,
+                "operation_id": operation_id,
+            }
 
         print(f"  [~] Upload diterima, menunggu moderasi Roblox...")
-        poll = self._poll_operation(operation_id, max_wait=moderation_timeout)
-        print(" " * 60, end="\r")
+        poll = self._poll_operation(operation_id, max_wait=moderation_timeout, interval=15)
+        print(" " * 70, end="\r")  # clear progress line
 
         asset_id = poll["asset_id"]
         return {
