@@ -145,8 +145,9 @@ def prompt_roblox_upload(output_paths: list[str], track_title: str) -> None:
             return
 
     # Collect credentials
+    import getpass
     print()
-    api_key = input("  Masukkan Roblox API Key: ").strip()
+    api_key = getpass.getpass("  Masukkan Roblox API Key: ").strip()
     if not api_key:
         print("  [ERR] API key tidak boleh kosong.")
         return
@@ -155,6 +156,11 @@ def prompt_roblox_upload(output_paths: list[str], track_title: str) -> None:
     if not user_id:
         print("  [ERR] User ID tidak boleh kosong.")
         return
+
+    # Mask API key confirmation
+    masked = api_key[:6] + "*" * max(0, len(api_key) - 6)
+    print(f"  API Key  : {masked}")
+    print(f"  User ID  : {user_id}")
 
     # Upload each selected file
     uploader = RobloxUploader(api_key=api_key, user_id=user_id)
@@ -166,9 +172,7 @@ def prompt_roblox_upload(output_paths: list[str], track_title: str) -> None:
     success_count = 0
     for i, filepath in enumerate(selected_paths, 1):
         from pathlib import Path
-        fname = Path(filepath).stem
 
-        # Use track title for single file, add part number for multiple
         if len(selected_paths) == 1:
             display_name = track_title[:50]
         else:
@@ -176,34 +180,35 @@ def prompt_roblox_upload(output_paths: list[str], track_title: str) -> None:
 
         print(f"  [{i}/{len(selected_paths)}] Uploading: {display_name}")
 
+        # Poll terus sampai status final (approved/rejected) — timeout 24 jam
         result = uploader.upload(
             filepath=filepath,
             display_name=display_name,
+            wait_moderation=True,
+            moderation_timeout=86400,
         )
 
         if result["success"]:
-            success_count += 1
-            asset_id   = result.get("asset_id") or "N/A"
-            asset_url  = result.get("asset_url") or ""
-            mod_state  = result.get("moderation_state") or "Reviewing"
-            mod_note   = result.get("moderation_note")
+            asset_id  = result.get("asset_id") or "N/A"
+            asset_url = result.get("asset_url") or ""
+            mod_state = result.get("moderation_state") or "Reviewing"
+            mod_note  = result.get("moderation_note")
 
-            # Moderation status icon
             if mod_state == "Approved":
-                mod_icon = "[APPROVED]"
+                success_count += 1
+                print(f"  [OK] Asset ID   : {asset_id}")
+                if asset_url:
+                    print(f"       rbxassetid  : {asset_url}")
+                print(f"       Moderasi    : [APPROVED] Siap dipakai!")
             elif mod_state == "Rejected":
-                mod_icon = "[REJECTED]"
+                print(f"  [REJECTED] Asset ID : {asset_id}")
+                print(f"             Moderasi : [REJECTED] Asset ditolak Roblox.")
+                if mod_note:
+                    print(f"             Alasan   : {mod_note}")
             else:
-                mod_icon = "[REVIEWING]"
-
-            print(f"  [OK] Asset ID   : {asset_id}")
-            if asset_url:
-                print(f"       rbxassetid  : {asset_url}")
-            print(f"       Moderasi    : {mod_icon}")
-            if mod_state == "Rejected" and mod_note:
-                print(f"       Alasan      : {mod_note}")
-            elif mod_state == "Reviewing":
-                print(f"       [!] Asset masih dalam review. Cek di Creator Dashboard.")
+                success_count += 1
+                print(f"  [?] Asset ID    : {asset_id}")
+                print(f"      Moderasi    : [REVIEWING] Cek manual di Creator Dashboard.")
         else:
             print(f"  [ERR] {result['error']}")
 
