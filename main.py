@@ -12,6 +12,7 @@ Usage:
     python main.py <url> --max-duration 300
     python main.py <url> --no-split
     python main.py <url> --keep-source
+    python main.py <url> --upload-roblox
 """
 
 import sys
@@ -19,6 +20,7 @@ import argparse
 from src.downloader import get_downloader
 from src.converter import AudioConverter
 from src.filename_generator import build_filename
+from src.roblox_uploader import RobloxUploader
 from src import ui
 
 SUPPORTED_DOMAINS = (
@@ -79,6 +81,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable auto-splitting for long audio",
     )
+    parser.add_argument(
+        "--upload-roblox",
+        action="store_true",
+        help="Prompt to upload result to Roblox after conversion",
+    )
     return parser.parse_args()
 
 
@@ -91,6 +98,103 @@ def detect_source(url: str) -> str:
     if "open.spotify.com" in url_lower or "spotify.link" in url_lower:
         return "Spotify"
     return "Unknown"
+
+
+def prompt_roblox_upload(output_paths: list[str], track_title: str) -> None:
+    """
+    Interactively ask user which files to upload to Roblox,
+    then collect API key + userId and upload.
+    """
+    print()
+    print("  ┌─────────────────────────────────────────┐")
+    print("  │         UPLOAD KE ROBLOX                │")
+    print("  └─────────────────────────────────────────┘")
+
+    # Show file list
+    print()
+    print("  File yang tersedia:")
+    for i, path in enumerate(output_paths, 1):
+        from pathlib import Path
+        print(f"    [{i}] {Path(path).name}")
+
+    print()
+
+    # Ask which files to upload
+    if len(output_paths) == 1:
+        choice_input = input("  Upload file ini ke Roblox? (y/n): ").strip().lower()
+        if choice_input != "y":
+            print("  [SKIP] Upload dibatalkan.")
+            return
+        selected_paths = output_paths
+    else:
+        print("  Masukkan nomor file yang mau diupload (pisah koma, atau 'all'):")
+        choice_input = input("  Pilihan: ").strip().lower()
+
+        if choice_input == "all":
+            selected_paths = output_paths
+        else:
+            try:
+                indices = [int(x.strip()) - 1 for x in choice_input.split(",")]
+                selected_paths = [output_paths[i] for i in indices if 0 <= i < len(output_paths)]
+            except (ValueError, IndexError):
+                print("  [ERR] Input tidak valid. Upload dibatalkan.")
+                return
+
+        if not selected_paths:
+            print("  [SKIP] Tidak ada file dipilih.")
+            return
+
+    # Collect credentials
+    print()
+    api_key = input("  Masukkan Roblox API Key: ").strip()
+    if not api_key:
+        print("  [ERR] API key tidak boleh kosong.")
+        return
+
+    user_id = input("  Masukkan Roblox User ID: ").strip()
+    if not user_id:
+        print("  [ERR] User ID tidak boleh kosong.")
+        return
+
+    # Upload each selected file
+    uploader = RobloxUploader(api_key=api_key, user_id=user_id)
+
+    print()
+    print(f"  Mengupload {len(selected_paths)} file...")
+    print()
+
+    success_count = 0
+    for i, filepath in enumerate(selected_paths, 1):
+        from pathlib import Path
+        fname = Path(filepath).stem
+
+        # Use track title for single file, add part number for multiple
+        if len(selected_paths) == 1:
+            display_name = track_title[:50]
+        else:
+            display_name = f"{track_title[:44]} pt{i}"
+
+        print(f"  [{i}/{len(selected_paths)}] Uploading: {display_name}")
+
+        result = uploader.upload(
+            filepath=filepath,
+            display_name=display_name,
+        )
+
+        if result["success"]:
+            success_count += 1
+            asset_id = result.get("asset_id", "N/A")
+            asset_url = result.get("asset_url", "")
+            print(f"  [OK] Asset ID : {asset_id}")
+            if asset_url:
+                print(f"       rbxassetid: {asset_url}")
+        else:
+            print(f"  [ERR] {result['error']}")
+
+    # Summary
+    print()
+    print(f"  Upload selesai: {success_count}/{len(selected_paths)} berhasil.")
+    print()
 
 
 def main() -> None:
@@ -172,6 +276,11 @@ def main() -> None:
 
     # ── Results ──
     ui.print_results(output_paths)
+
+    # ── Step 4: Upload ke Roblox (manual prompt) ──
+    if args.upload_roblox:
+        prompt_roblox_upload(output_paths, title)
+
     ui.print_done()
 
 
