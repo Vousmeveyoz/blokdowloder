@@ -478,9 +478,10 @@ class AudioModifier:
         # Micro-randomize FFT real/imag bins — breaks spectral fingerprint
         if profile.spectral_blur is not None:
             s = profile.spectral_blur
+            inv = round(1 - s, 6)
             filters.append(
-                f"afftfilt=real='re*(1-{s})+{s}*(random(0)-0.5)'"
-                f":imag='im*(1-{s})+{s}*(random(1)-0.5)'"
+                f"afftfilt=real=re*{inv}+{s}*(random(0)-0.5)"
+                f":imag=im*{inv}+{s}*(random(1)-0.5)"
             )
 
         # ── Layer 5: Mid-Side processing ──
