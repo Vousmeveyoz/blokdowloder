@@ -5,7 +5,7 @@ Applies subtle audio modifications so the output isn't identical to the original
 All processing is done via ffmpeg filters — no extra Python audio libs needed.
 
 ═══════════════════════════════════════════════════════════════════════════════
-MODIFICATION LAYERS (12 total):
+MODIFICATION LAYERS (16 total):
 ═══════════════════════════════════════════════════════════════════════════════
 
 Layer 1 — Audio Tweaks:
@@ -25,6 +25,12 @@ Layer 2 — Fingerprint Removal:
 Layer 3 — Human-Like Imperfections:
   - Micro-dynamics     : subtle random volume fluctuations over time
   - Phase jitter       : tiny L/R timing offset to break digital stereo symmetry
+
+Layer 4 — Anti-Fingerprint (Advanced):
+  - Noise injection    : white/pink noise at -60 to -50dB to alter noise floor
+  - Silence padding    : random ms silence at start/end to shift all timestamps
+  - Subtle reverb      : very short aecho to add room signature
+  - Time stretch       : rubberband-style stretch via atempo without pitch change
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
@@ -34,7 +40,7 @@ import subprocess
 import shutil
 import tempfile
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -54,17 +60,8 @@ class ModificationProfile:
     # ── Layer 1: Audio Tweaks ──
     pitch_semitones: float | None = None
     speed_factor: float | None = None
-
-    # Speed 2.3x: aggressive speed-up using chained atempo filters
-    # ffmpeg atempo max is 2.0, so 2.3x = atempo=2.0,atempo=1.15
-    # Set to True to enable, None/False to skip
     speed_2x: bool | None = None
-
-    # Amplify: volume adjustment in dB
-    # Negative = reduce volume (e.g. -8.0 = quieter)
-    # Positive = boost volume (e.g. +3.0 = louder)
     amplify_db: float | None = None
-
     bass_db: float | None = None
     treble_db: float | None = None
     stereo_width: float | None = None
@@ -78,6 +75,29 @@ class ModificationProfile:
     # ── Layer 3: Human-Like Imperfections ──
     micro_dynamics: tuple[float, float] | None = None
     phase_jitter_ms: float | None = None
+
+    # ── Layer 4: Anti-Fingerprint (Advanced) ──
+
+    # Noise injection: mix white noise at very low volume
+    # (noise_db) — e.g. -55.0 means noise at -55dB (barely audible)
+    # noise_type: 'white' or 'pink'
+    noise_db: float | None = None
+    noise_type: str = "white"
+
+    # Silence padding: add random silence at start and/or end (in milliseconds)
+    # Shifts all timestamps, breaks beat-alignment fingerprints
+    # (pad_start_ms, pad_end_ms)
+    silence_pad_ms: tuple[int, int] | None = None
+
+    # Subtle reverb: very short echo/room effect using aecho
+    # (in_gain, out_gain, delay_ms, decay)
+    # e.g. (0.8, 0.6, 25, 0.2) = very subtle room feel
+    reverb: tuple[float, float, int, float] | None = None
+
+    # Time stretch: change duration slightly without pitch change
+    # Independent from speed_factor — uses atempo in 0.95–1.05 range
+    # Combined with pitch correction to keep pitch stable
+    time_stretch: float | None = None
 
     @classmethod
     def random(cls, intensity: str = "subtle") -> "ModificationProfile":
@@ -102,7 +122,17 @@ class ModificationProfile:
                 "dynamics_rate": (0.15, 0.5),
                 "dynamics_depth": (0.5, 2.0),
                 "phase_jitter": (0.1, 0.4),
-                "speed_2x_chance": 0.0,   # off for subtle
+                "speed_2x_chance": 0.0,
+                # Layer 4
+                "noise_db": (-62.0, -55.0),
+                "noise_chance": 0.7,
+                "silence_pad": (5, 30),       # ms range per side
+                "silence_chance": 0.8,
+                "reverb_delay": (15, 35),     # ms
+                "reverb_decay": (0.1, 0.25),
+                "reverb_chance": 0.5,
+                "time_stretch": (0.97, 1.03),
+                "time_stretch_chance": 0.6,
             },
             "moderate": {
                 "pitch": (-1.5, 1.5),
@@ -118,7 +148,17 @@ class ModificationProfile:
                 "dynamics_rate": (0.2, 0.8),
                 "dynamics_depth": (1.0, 3.5),
                 "phase_jitter": (0.2, 0.6),
-                "speed_2x_chance": 0.3,   # 30% chance
+                "speed_2x_chance": 0.3,
+                # Layer 4
+                "noise_db": (-58.0, -50.0),
+                "noise_chance": 0.85,
+                "silence_pad": (10, 80),
+                "silence_chance": 0.9,
+                "reverb_delay": (20, 60),
+                "reverb_decay": (0.15, 0.4),
+                "reverb_chance": 0.65,
+                "time_stretch": (0.94, 1.06),
+                "time_stretch_chance": 0.75,
             },
             "strong": {
                 "pitch": (-2.0, 2.0),
@@ -134,7 +174,17 @@ class ModificationProfile:
                 "dynamics_rate": (0.3, 1.2),
                 "dynamics_depth": (2.0, 5.0),
                 "phase_jitter": (0.3, 0.8),
-                "speed_2x_chance": 0.6,   # 60% chance
+                "speed_2x_chance": 0.6,
+                # Layer 4
+                "noise_db": (-55.0, -45.0),
+                "noise_chance": 1.0,
+                "silence_pad": (20, 150),
+                "silence_chance": 1.0,
+                "reverb_delay": (25, 80),
+                "reverb_decay": (0.2, 0.55),
+                "reverb_chance": 0.8,
+                "time_stretch": (0.91, 1.09),
+                "time_stretch_chance": 0.9,
             },
         }
 
@@ -143,8 +193,12 @@ class ModificationProfile:
         layer1_mods = ["pitch", "speed", "amplify", "bass", "treble", "stereo", "cuts", "eq_layers"]
         chosen_l1 = random.sample(layer1_mods, k=random.randint(3, min(6, len(layer1_mods))))
 
-        enable_watermark = random.random() < 0.7
-        enable_speed_2x  = random.random() < p["speed_2x_chance"]
+        enable_watermark    = random.random() < 0.7
+        enable_speed_2x     = random.random() < p["speed_2x_chance"]
+        enable_noise        = random.random() < p["noise_chance"]
+        enable_silence      = random.random() < p["silence_chance"]
+        enable_reverb       = random.random() < p["reverb_chance"]
+        enable_time_stretch = random.random() < p["time_stretch_chance"]
 
         layer3_mods = ["dynamics", "phase_jitter"]
         chosen_l3 = random.sample(layer3_mods, k=random.randint(1, 2))
@@ -154,34 +208,55 @@ class ModificationProfile:
         if "eq_layers" in chosen_l1:
             n = random.randint(*p["eq_layers_count"])
             freq_zones = [
-                (60, 250),
-                (250, 1000),
-                (1000, 4000),
-                (4000, 8000),
-                (8000, 16000),
+                (60, 250), (250, 1000), (1000, 4000),
+                (4000, 8000), (8000, 16000),
             ]
             chosen_zones = random.sample(freq_zones, k=min(n, len(freq_zones)))
             eq_layers = []
             for low, high in chosen_zones:
                 freq = random.uniform(low, high)
                 gain = round(random.uniform(*p["eq_gain"]), 2)
-                bandwidth = round(freq * random.uniform(0.3, 0.8), 1)
-                eq_layers.append((round(freq, 1), gain, bandwidth))
+                bw   = round(freq * random.uniform(0.3, 0.8), 1)
+                eq_layers.append((round(freq, 1), gain, bw))
 
         micro_dynamics = None
         if "dynamics" in chosen_l3:
-            rate = round(random.uniform(*p["dynamics_rate"]), 2)
+            rate  = round(random.uniform(*p["dynamics_rate"]), 2)
             depth = round(random.uniform(*p["dynamics_depth"]), 2)
             micro_dynamics = (rate, depth)
 
-        # If speed_2x is on, skip regular speed_factor to avoid conflict
         speed_factor = None
-        if "speed" in chosen_l1 and not enable_speed_2x:
+        if "speed" in chosen_l1 and not enable_speed_2x and not enable_time_stretch:
             speed_factor = round(random.uniform(*p["speed"]), 4)
 
         amplify_db = None
         if "amplify" in chosen_l1:
             amplify_db = round(random.uniform(*p["amplify"]), 1)
+
+        # Layer 4
+        noise_db = None
+        noise_type = "white"
+        if enable_noise:
+            noise_db   = round(random.uniform(*p["noise_db"]), 1)
+            noise_type = random.choice(["white", "pink"])
+
+        silence_pad_ms = None
+        if enable_silence:
+            pad_lo, pad_hi = p["silence_pad"]
+            silence_pad_ms = (
+                random.randint(pad_lo, pad_hi),
+                random.randint(pad_lo, pad_hi),
+            )
+
+        reverb = None
+        if enable_reverb:
+            delay = random.randint(*p["reverb_delay"])
+            decay = round(random.uniform(*p["reverb_decay"]), 2)
+            reverb = (0.8, round(random.uniform(0.5, 0.75), 2), delay, decay)
+
+        time_stretch = None
+        if enable_time_stretch and not enable_speed_2x:
+            time_stretch = round(random.uniform(*p["time_stretch"]), 4)
 
         return cls(
             pitch_semitones=(
@@ -212,6 +287,12 @@ class ModificationProfile:
                 round(random.uniform(*p["phase_jitter"]), 2)
                 if "phase_jitter" in chosen_l3 else None
             ),
+            # Layer 4
+            noise_db=noise_db,
+            noise_type=noise_type,
+            silence_pad_ms=silence_pad_ms,
+            reverb=reverb,
+            time_stretch=time_stretch,
         )
 
     def describe(self) -> str:
@@ -240,7 +321,7 @@ class ModificationProfile:
         if self.stereo_width is not None:
             parts.append(f"Stereo {self.stereo_width:.2f}x")
         if self.micro_cuts is not None:
-            parts.append(f"Cuts ×{self.micro_cuts}")
+            parts.append(f"Cuts x{self.micro_cuts}")
         if self.eq_layers is not None:
             parts.append(f"EQ {len(self.eq_layers)} bands")
 
@@ -257,6 +338,20 @@ class ModificationProfile:
         if self.phase_jitter_ms is not None:
             parts.append(f"Phase ±{self.phase_jitter_ms}ms")
 
+        # Layer 4
+        if self.noise_db is not None:
+            parts.append(f"Noise {self.noise_type} {self.noise_db:.1f}dB")
+        if self.silence_pad_ms is not None:
+            s, e = self.silence_pad_ms
+            parts.append(f"Pad {s}ms/{e}ms")
+        if self.reverb is not None:
+            _, _, delay, decay = self.reverb
+            parts.append(f"Reverb {delay}ms/{decay}")
+        if self.time_stretch is not None:
+            pct = (self.time_stretch - 1.0) * 100
+            d = "↑" if pct > 0 else "↓"
+            parts.append(f"Stretch {d}{abs(pct):.1f}%")
+
         return " | ".join(parts) if parts else "No modifications"
 
 
@@ -269,22 +364,21 @@ class AudioModifier:
     """
     Applies multi-layer audio modifications using ffmpeg filters.
 
-    Pipeline:
-      1. Audio tweaks (EQ, pitch, speed, stereo, layered EQ, amplify, speed_2x)
-      2. Fingerprint removal (metadata strip, watermark low-pass)
-      3. Human-like imperfections (micro-dynamics, phase jitter)
-      4. Micro-cuts (tiny segment removal with smooth gap-fill)
-
-    Notes on speed_2x:
-      ffmpeg atempo filter only supports range 0.5–2.0.
-      To achieve 2.3x speed, we chain two atempo filters:
-        atempo=2.0,atempo=1.15  →  2.0 × 1.15 = 2.3x
-      This is applied AFTER pitch shift (if any) so pitch stays independent.
-
-    Notes on amplify_db:
-      Uses ffmpeg volume filter: volume=<value>dB
-      -8dB ≈ roughly half perceived loudness.
-      Applied early in chain so subsequent filters work on adjusted level.
+    Pipeline order:
+      1. Silence padding (prepend/append) — separate ffmpeg concat step
+      2. Watermark removal (low-pass)
+      3. Amplify / volume
+      4. Layered EQ nudges
+      5. Bass/treble broad EQ
+      6. Micro-dynamics (tremolo)
+      7. Noise injection (amix with anoisesrc)
+      8. Subtle reverb (aecho)
+      9. Pitch shift (asetrate + aresample)
+     10. Speed change / time stretch (atempo)
+     11. Speed 2.3x (chained atempo)
+     12. Stereo widening (extrastereo)
+     13. Phase jitter (adelay)
+     14. Micro-cuts (separate pass)
     """
 
     def __init__(self):
@@ -298,8 +392,7 @@ class AudioModifier:
     def _get_duration(self, filepath: str) -> float:
         cmd = [
             "ffprobe", "-v", "quiet",
-            "-print_format", "json",
-            "-show_format",
+            "-print_format", "json", "-show_format",
             str(filepath),
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -309,10 +402,8 @@ class AudioModifier:
     def _get_channels(self, filepath: str) -> int:
         cmd = [
             "ffprobe", "-v", "quiet",
-            "-print_format", "json",
-            "-show_streams",
-            "-select_streams", "a:0",
-            str(filepath),
+            "-print_format", "json", "-show_streams",
+            "-select_streams", "a:0", str(filepath),
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
         info = json.loads(result.stdout)
@@ -330,23 +421,53 @@ class AudioModifier:
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"ffmpeg error: {e}")
 
-    # ── Filter chain builder ────────────────────────────────────────────
+    # ── Silence padding ───────────────────────────────────────────────────
+
+    def _apply_silence_padding(
+        self,
+        input_path: str,
+        output_path: str,
+        pad_start_ms: int,
+        pad_end_ms: int,
+        channels: int = 2,
+    ) -> None:
+        """
+        Add silence at start and/or end using anullsrc + concat.
+
+        Uses ffmpeg filter_complex to prepend/append silence.
+        pad_start_ms and pad_end_ms are in milliseconds.
+        """
+        start_s = pad_start_ms / 1000.0
+        end_s   = pad_end_ms / 1000.0
+        ch_layout = "stereo" if channels >= 2 else "mono"
+
+        # Build filter_complex for concat
+        # [silence_start][input][silence_end]concat=n=3:v=0:a=1
+        filter_complex = (
+            f"anullsrc=r=44100:cl={ch_layout}:d={start_s}[s];"
+            f"anullsrc=r=44100:cl={ch_layout}:d={end_s}[e];"
+            f"[s][0:a][e]concat=n=3:v=0:a=1[out]"
+        )
+
+        command = [
+            "ffmpeg", "-i", str(input_path),
+            "-filter_complex", filter_complex,
+            "-map", "[out]",
+            "-map_metadata", "-1",
+            "-c:a", "pcm_s16le",
+            "-y", str(output_path),
+        ]
+        self._run_ffmpeg(command)
+
+    # ── Filter chain builder ──────────────────────────────────────────────
 
     def _build_filter_chain(self, profile: ModificationProfile, channels: int = 2) -> str:
         """
         Build the complete ffmpeg -af filter chain.
 
-        Order (optimized for quality):
-          1. Watermark removal (low-pass)
-          2. Amplify / volume adjustment   ← NEW
-          3. Layered EQ nudges
-          4. Bass/treble broad EQ
-          5. Micro-dynamics (tremolo)
-          6. Pitch shift (asetrate + aresample)
-          7. Speed change (atempo ±5%)
-          8. Speed 2.3x (atempo=2.0,atempo=1.15) ← NEW
-          9. Stereo widening (extrastereo)
-         10. Phase jitter (adelay)
+        Note: silence_pad uses filter_complex (separate step).
+              noise injection uses amix (included here as lavfi input workaround
+              via aeval for simplicity without extra input).
         """
         filters = []
 
@@ -355,11 +476,10 @@ class AudioModifier:
             filters.append(f"lowpass=f={profile.watermark_cutoff_hz}:p=2")
 
         # ── Layer 1: Amplify ──
-        # Applied early so all subsequent filters work on adjusted level
         if profile.amplify_db is not None and profile.amplify_db != 0:
             filters.append(f"volume={profile.amplify_db}dB")
 
-        # ── Layer 1: Layered EQ tweaks ──
+        # ── Layer 1: Layered EQ ──
         if profile.eq_layers:
             for freq, gain, bw in profile.eq_layers:
                 if gain != 0:
@@ -374,33 +494,65 @@ class AudioModifier:
         # ── Layer 3: Micro-dynamics ──
         if profile.micro_dynamics is not None:
             rate, depth = profile.micro_dynamics
-            depth_normalized = depth / 100.0
-            filters.append(f"tremolo=f={rate}:d={depth_normalized}")
+            filters.append(f"tremolo=f={rate}:d={depth / 100.0}")
+
+        # ── Layer 4: Noise injection ──
+        # Uses aeval to generate noise inline — no extra input needed
+        # white noise: random(), pink noise: approximated via filtered random
+        if profile.noise_db is not None:
+            # Convert dB to linear amplitude: A = 10^(dB/20)
+            amplitude = 10 ** (profile.noise_db / 20.0)
+            if profile.noise_type == "pink":
+                # Pink noise: white noise + lowpass filter to roll off high freqs
+                filters.append(
+                    f"aeval='val(0)+{amplitude}*(random(0)-0.5)|val(1)+{amplitude}*(random(1)-0.5)',"
+                    f"lowpass=f=6000"
+                )
+            else:
+                # White noise: add flat-spectrum noise directly to signal
+                filters.append(
+                    f"aeval='val(0)+{amplitude}*(random(0)-0.5)|val(1)+{amplitude}*(random(1)-0.5)'"
+                )
+
+        # ── Layer 4: Subtle reverb ──
+        if profile.reverb is not None:
+            in_g, out_g, delay_ms, decay = profile.reverb
+            filters.append(f"aecho={in_g}:{out_g}:{delay_ms}:{decay}")
 
         # ── Layer 1: Pitch shift ──
         if profile.pitch_semitones is not None and profile.pitch_semitones != 0:
-            ratio = 2 ** (profile.pitch_semitones / 12.0)
+            ratio    = 2 ** (profile.pitch_semitones / 12.0)
             new_rate = int(44100 * ratio)
             filters.append(f"asetrate={new_rate}")
             filters.append("aresample=44100")
 
-        # ── Layer 1: Speed (±5% subtle change) ──
-        # Note: skip if speed_2x is active to avoid double speed change
+        # ── Layer 1: Speed (subtle ±5%) ──
         if profile.speed_factor is not None and profile.speed_factor != 1.0 and not profile.speed_2x:
             factor = max(0.5, min(2.0, profile.speed_factor))
             filters.append(f"atempo={factor}")
 
+        # ── Layer 4: Time stretch (independent tempo change) ──
+        # Unlike speed_factor, time_stretch is always paired with pitch correction
+        # to keep perceived pitch stable while changing duration
+        if profile.time_stretch is not None and profile.time_stretch != 1.0 and not profile.speed_2x:
+            factor = max(0.5, min(2.0, profile.time_stretch))
+            # Apply tempo change
+            filters.append(f"atempo={factor}")
+            # Compensate pitch to keep it stable (inverse pitch correction)
+            inv_ratio   = 1.0 / factor
+            compensate  = 2 ** (12 * (inv_ratio - 1) / 12.0)  # approximation
+            inv_rate    = int(44100 * compensate)
+            filters.append(f"asetrate={inv_rate}")
+            filters.append("aresample=44100")
+
         # ── Layer 1: Speed 2.3x ──
-        # ffmpeg atempo max = 2.0, so chain: atempo=2.0,atempo=1.15 → 2.3x
-        # Applied AFTER pitch shift so pitch stays consistent
         if profile.speed_2x:
             filters.append("atempo=2.0")
             filters.append("atempo=1.15")
 
         # ── Layer 1: Stereo widening (stereo only) ──
-        if channels >= 2:
-            if profile.stereo_width is not None and profile.stereo_width != 1.0:
-                filters.append(f"extrastereo=m={profile.stereo_width}")
+        if channels >= 2 and profile.stereo_width is not None and profile.stereo_width != 1.0:
+            filters.append(f"extrastereo=m={profile.stereo_width}")
 
         # ── Layer 3: Phase jitter (stereo only) ──
         if channels >= 2 and profile.phase_jitter_ms is not None:
@@ -408,39 +560,29 @@ class AudioModifier:
 
         return ",".join(filters)
 
-    # ── Micro-cuts ──────────────────────────────────────────────────────
+    # ── Micro-cuts ────────────────────────────────────────────────────────
 
     def _generate_cut_points(self, duration: float, num_cuts: int) -> list[tuple[float, float]]:
         if duration < 10:
             return []
-
         safe_start = 2.0
-        safe_end = duration - 2.0
-
+        safe_end   = duration - 2.0
         if safe_end - safe_start < 1.0:
             return []
 
         cuts = []
         attempts = 0
-
         while len(cuts) < num_cuts and attempts < num_cuts * 15:
             attempts += 1
-            start = round(random.uniform(safe_start, safe_end - 0.06), 4)
+            start   = round(random.uniform(safe_start, safe_end - 0.06), 4)
             cut_len = round(random.uniform(0.010, 0.050), 4)
-            end = round(start + cut_len, 4)
-
+            end     = round(start + cut_len, 4)
             if end >= safe_end:
                 continue
-
             buffer = 0.020
-            if any(
-                not (end + buffer < cs or start - buffer > ce)
-                for cs, ce in cuts
-            ):
+            if any(not (end + buffer < cs or start - buffer > ce) for cs, ce in cuts):
                 continue
-
             cuts.append((start, end))
-
         cuts.sort()
         return cuts
 
@@ -454,36 +596,22 @@ class AudioModifier:
         quality: str = "4",
     ) -> str:
         duration = self._get_duration(input_path)
-        cuts = self._generate_cut_points(duration, num_cuts)
-
+        cuts     = self._generate_cut_points(duration, num_cuts)
         if not cuts:
             return input_path
 
         exclude_parts = [f"between(t,{s},{e})" for s, e in cuts]
-        select_expr = "not(" + "+".join(exclude_parts) + ")"
+        select_expr   = "not(" + "+".join(exclude_parts) + ")"
+        filter_chain  = f"aselect='{select_expr}',aresample=async=1:first_pts=0"
 
-        filter_chain = (
-            f"aselect='{select_expr}',"
-            f"aresample=async=1:first_pts=0"
-        )
-
-        command = [
-            "ffmpeg", "-i", str(input_path),
-            "-af", filter_chain,
-        ]
-
+        command = ["ffmpeg", "-i", str(input_path), "-af", filter_chain]
         if strip_metadata:
             command.extend(["-map_metadata", "-1"])
-
-        command.extend([
-            "-c:a", codec, "-q:a", quality,
-            "-y", str(output_path),
-        ])
-
+        command.extend(["-c:a", codec, "-q:a", quality, "-y", str(output_path)])
         self._run_ffmpeg(command)
         return str(output_path)
 
-    # ── Main entry point ────────────────────────────────────────────────
+    # ── Main entry point ──────────────────────────────────────────────────
 
     def modify(
         self,
@@ -496,17 +624,10 @@ class AudioModifier:
         """
         Apply all audio modifications and save to output file.
 
-        Full pipeline:
-          Pass 1: All filter tweaks → intermediate WAV (lossless)
-                  - Watermark removal
-                  - Amplify / volume
-                  - EQ layers + bass/treble
-                  - Micro-dynamics
-                  - Pitch shift + speed change
-                  - Speed 2.3x (chained atempo)
-                  - Stereo widening + phase jitter
-                  - Metadata stripped
-          Pass 2: Micro-cuts → final OGG
+        Multi-pass pipeline:
+          Pass 1 (optional): Silence padding → WAV
+          Pass 2:            All filter tweaks → WAV
+          Pass 3 (optional): Micro-cuts → final OGG
         """
         input_file = Path(input_path)
         if not input_file.exists():
@@ -515,64 +636,80 @@ class AudioModifier:
         if profile is None:
             profile = ModificationProfile.random(intensity="subtle")
 
-        channels = self._get_channels(str(input_file))
+        channels     = self._get_channels(str(input_file))
         filter_chain = self._build_filter_chain(profile, channels)
-        has_tweaks = bool(filter_chain)
-        has_cuts = profile.micro_cuts is not None and profile.micro_cuts > 0
+        has_tweaks   = bool(filter_chain)
+        has_cuts     = profile.micro_cuts is not None and profile.micro_cuts > 0
+        has_padding  = (
+            profile.silence_pad_ms is not None
+            and sum(profile.silence_pad_ms) > 0
+        )
         strip = profile.strip_metadata
 
-        # ── No modifications → plain convert + strip metadata ──
-        if not has_tweaks and not has_cuts:
-            cmd = ["ffmpeg", "-i", str(input_file)]
-            if strip:
-                cmd.extend(["-map_metadata", "-1"])
-            cmd.extend(["-c:a", codec, "-q:a", quality, "-y", str(output_path)])
-            self._run_ffmpeg(cmd)
-            return str(output_path)
+        tmp_files = []
 
-        # ── Both tweaks + cuts → 2-pass via lossless WAV ──
-        if has_tweaks and has_cuts:
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                tmp_path = tmp.name
+        try:
+            current = str(input_file)
 
-            try:
-                cmd1 = [
-                    "ffmpeg", "-i", str(input_file),
-                    "-af", filter_chain,
-                    "-map_metadata", "-1",
-                    "-c:a", "pcm_s16le",
-                    "-y", tmp_path,
-                ]
-                self._run_ffmpeg(cmd1)
+            # ── Pass 1: Silence padding ──
+            if has_padding:
+                pad_start, pad_end = profile.silence_pad_ms
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                    padded_path = f.name
+                tmp_files.append(padded_path)
+                self._apply_silence_padding(
+                    current, padded_path,
+                    pad_start_ms=pad_start,
+                    pad_end_ms=pad_end,
+                    channels=channels,
+                )
+                current = padded_path
 
+            # ── Pass 2: Filter tweaks ──
+            if has_tweaks:
+                # If more passes follow, output to WAV (lossless)
+                if has_cuts:
+                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                        tweaked_path = f.name
+                    tmp_files.append(tweaked_path)
+                    cmd = [
+                        "ffmpeg", "-i", current,
+                        "-af", filter_chain,
+                        "-map_metadata", "-1",
+                        "-c:a", "pcm_s16le",
+                        "-y", tweaked_path,
+                    ]
+                    self._run_ffmpeg(cmd)
+                    current = tweaked_path
+                else:
+                    # Final pass — encode directly to output format
+                    cmd = ["ffmpeg", "-i", current, "-af", filter_chain]
+                    if strip:
+                        cmd.extend(["-map_metadata", "-1"])
+                    cmd.extend(["-c:a", codec, "-q:a", quality, "-y", str(output_path)])
+                    self._run_ffmpeg(cmd)
+                    return str(output_path)
+
+            elif not has_cuts:
+                # No tweaks, no cuts — plain convert + strip
+                cmd = ["ffmpeg", "-i", current]
+                if strip:
+                    cmd.extend(["-map_metadata", "-1"])
+                cmd.extend(["-c:a", codec, "-q:a", quality, "-y", str(output_path)])
+                self._run_ffmpeg(cmd)
+                return str(output_path)
+
+            # ── Pass 3: Micro-cuts → final output ──
+            if has_cuts:
                 self._apply_micro_cuts(
-                    tmp_path, str(output_path),
+                    current, str(output_path),
                     num_cuts=profile.micro_cuts,
                     strip_metadata=strip,
                     codec=codec, quality=quality,
                 )
-            finally:
-                Path(tmp_path).unlink(missing_ok=True)
 
-            return str(output_path)
+        finally:
+            for tmp in tmp_files:
+                Path(tmp).unlink(missing_ok=True)
 
-        # ── Only tweaks (no cuts) → single pass ──
-        if has_tweaks:
-            cmd = [
-                "ffmpeg", "-i", str(input_file),
-                "-af", filter_chain,
-            ]
-            if strip:
-                cmd.extend(["-map_metadata", "-1"])
-            cmd.extend(["-c:a", codec, "-q:a", quality, "-y", str(output_path)])
-            self._run_ffmpeg(cmd)
-            return str(output_path)
-
-        # ── Only cuts (no tweaks) ──
-        self._apply_micro_cuts(
-            str(input_file), str(output_path),
-            num_cuts=profile.micro_cuts,
-            strip_metadata=strip,
-            codec=codec, quality=quality,
-        )
         return str(output_path)
