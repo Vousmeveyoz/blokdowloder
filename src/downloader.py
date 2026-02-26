@@ -152,10 +152,15 @@ class YtdlpDownloader(BaseDownloader):
         new_files = after_files - before_files
 
         if not new_files:
-            raise ValueError(
-                "Download selesai tapi file MP3 tidak ditemukan di folder temp. "
-                "Pastikan ffmpeg terinstall dengan benar."
-            )
+            # Fallback: ambil file MP3 paling baru di temp dir
+            all_mp3 = list(self.temp_dir.glob("*.mp3"))
+            if not all_mp3:
+                raise ValueError(
+                    "Download selesai tapi file MP3 tidak ditemukan di folder temp. "
+                    "Pastikan ffmpeg terinstall dengan benar."
+                )
+            # Gunakan file yang paling baru dimodifikasi
+            new_files = {max(all_mp3, key=lambda f: f.stat().st_mtime)}
 
         downloaded_file = max(new_files, key=lambda f: f.stat().st_mtime)
 
