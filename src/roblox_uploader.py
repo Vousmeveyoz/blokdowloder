@@ -140,7 +140,7 @@ class RobloxUploader:
         self,
         filepath: str,
         display_name: str,
-        description: str = "Uploaded via BLOKMARKET AUDIO",
+        description: str = "Audio",
         wait_moderation: bool = True,
         moderation_timeout: int = 86400,
     ) -> dict:
