@@ -183,11 +183,27 @@ def prompt_roblox_upload(output_paths: list[str], track_title: str) -> None:
 
         if result["success"]:
             success_count += 1
-            asset_id = result.get("asset_id", "N/A")
-            asset_url = result.get("asset_url", "")
-            print(f"  [OK] Asset ID : {asset_id}")
+            asset_id   = result.get("asset_id") or "N/A"
+            asset_url  = result.get("asset_url") or ""
+            mod_state  = result.get("moderation_state") or "Reviewing"
+            mod_note   = result.get("moderation_note")
+
+            # Moderation status icon
+            if mod_state == "Approved":
+                mod_icon = "[APPROVED]"
+            elif mod_state == "Rejected":
+                mod_icon = "[REJECTED]"
+            else:
+                mod_icon = "[REVIEWING]"
+
+            print(f"  [OK] Asset ID   : {asset_id}")
             if asset_url:
-                print(f"       rbxassetid: {asset_url}")
+                print(f"       rbxassetid  : {asset_url}")
+            print(f"       Moderasi    : {mod_icon}")
+            if mod_state == "Rejected" and mod_note:
+                print(f"       Alasan      : {mod_note}")
+            elif mod_state == "Reviewing":
+                print(f"       [!] Asset masih dalam review. Cek di Creator Dashboard.")
         else:
             print(f"  [ERR] {result['error']}")
 
