@@ -100,7 +100,7 @@ def detect_source(url: str) -> str:
     return "Unknown"
 
 
-def prompt_roblox_upload(output_paths: list[str], track_title: str) -> None:
+def prompt_roblox_upload(output_paths: list[str], track_title: str, clean_filename: str = "") -> None:
     """
     Interactively ask user which files to upload to Roblox,
     then collect API key + userId and upload.
@@ -173,10 +173,13 @@ def prompt_roblox_upload(output_paths: list[str], track_title: str) -> None:
     for i, filepath in enumerate(selected_paths, 1):
         from pathlib import Path
 
+        # Pakai clean_filename (sudah di-noise-clean) bukan judul asli
+        # supaya tidak kena DMCA metadata check di Roblox
+        base_name = clean_filename[:50] if clean_filename else track_title[:50]
         if len(selected_paths) == 1:
-            display_name = track_title[:50]
+            display_name = base_name[:50]
         else:
-            display_name = f"{track_title[:44]} pt{i}"
+            display_name = f"{base_name[:46]} {i}"
 
         print(f"  [{i}/{len(selected_paths)}] Uploading: {display_name}")
 
@@ -300,7 +303,7 @@ def main() -> None:
 
     # ── Step 4: Upload ke Roblox (manual prompt) ──
     if args.upload_roblox:
-        prompt_roblox_upload(output_paths, title)
+        prompt_roblox_upload(output_paths, title, clean_filename=output_filename)
 
     ui.print_done()
 
