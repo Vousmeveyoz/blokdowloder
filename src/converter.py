@@ -32,45 +32,6 @@ class AudioConverter:
                 "  Linux   : sudo apt install ffmpeg"
             )
 
-    def _strip_metadata(self, filepath: str) -> None:
-        """
-        Strip semua metadata dari file output menggunakan ffmpeg.
-        Ini memastikan tidak ada judul/artist asli yang tersisa.
-        """
-        path = Path(filepath)
-        temp_path = path.with_suffix(".tmp" + path.suffix)
-
-        command = [
-            "ffmpeg",
-            "-i", str(path),
-            "-map_metadata", "-1",           # hapus semua global metadata
-            "-metadata", "title=",            # kosongkan title
-            "-metadata", "artist=",           # kosongkan artist
-            "-metadata", "album=",            # kosongkan album
-            "-metadata", "comment=",          # kosongkan comment
-            "-metadata", "genre=",            # kosongkan genre
-            "-metadata", "date=",             # kosongkan date
-            "-metadata", "track=",            # kosongkan track number
-            "-metadata", "encoder=",          # kosongkan encoder info
-            "-c:a", "copy",                   # copy audio tanpa re-encode
-            "-y",
-            str(temp_path),
-        ]
-
-        try:
-            subprocess.run(
-                command,
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            # Replace original dengan versi bersih
-            temp_path.replace(path)
-        except subprocess.CalledProcessError:
-            # Kalau gagal, hapus temp file dan lanjut (file tetap ada tapi metadata mungkin masih ada)
-            if temp_path.exists():
-                temp_path.unlink()
-
     def _convert_single(
         self,
         input_filepath: str,
@@ -96,19 +57,12 @@ class AudioConverter:
                 output_path=str(output_path),
                 profile=profile,
             )
+            return str(output_path), profile
         else:
             command = [
                 "ffmpeg",
                 "-i", str(input_path),
                 "-map_metadata", "-1",
-                "-metadata", "title=",
-                "-metadata", "artist=",
-                "-metadata", "album=",
-                "-metadata", "comment=",
-                "-metadata", "genre=",
-                "-metadata", "date=",
-                "-metadata", "track=",
-                "-metadata", "encoder=",
                 "-c:a", "libvorbis",
                 "-q:a", "4",
                 "-y",
@@ -125,11 +79,7 @@ class AudioConverter:
             except subprocess.CalledProcessError as e:
                 raise RuntimeError(f"ffmpeg gagal convert: {e}")
 
-        # FIX: Selalu strip metadata setelah convert (baik modify maupun plain)
-        # untuk memastikan tidak ada judul/artist asli yang tersisa
-        self._strip_metadata(str(output_path))
-
-        return str(output_path), profile
+            return str(output_path), None
 
     def to_ogg(
         self,
