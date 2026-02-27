@@ -163,13 +163,17 @@ class RobloxUploader:
             "creationContext": {"creator": {"userId": self.user_id}}
         }
 
+        # FIX: Gunakan nama file generic supaya tidak bocor judul asli
+        # via multipart filename header ke Roblox API
+        safe_filename = f"audio{path.suffix.lower()}"
+
         try:
             with open(path, "rb") as f:
                 response = requests.post(
                     self.API_URL,
                     headers=self._headers(),
                     data={"request": json.dumps(request_body)},
-                    files={"fileContent": (path.name, f, content_type)},
+                    files={"fileContent": (safe_filename, f, content_type)},
                     timeout=60,
                 )
         except requests.exceptions.Timeout:
