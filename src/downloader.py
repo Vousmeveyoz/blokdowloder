@@ -135,7 +135,7 @@ class YtdlpDownloader(BaseDownloader):
         before_files = set(self.temp_dir.glob("*.mp3"))
 
         ydl_opts = {
-            "format": "bestaudio/best",
+            "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
             "outtmpl": str(self.temp_dir / "%(title)s.%(ext)s"),
             "restrictfilenames": False,
             "windowsfilenames": True,
