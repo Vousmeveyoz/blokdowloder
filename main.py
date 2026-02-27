@@ -12,13 +12,17 @@ Usage:
     python main.py <url> --max-duration 300
     python main.py <url> --no-split
     python main.py <url> --keep-source
+    python main.py <url> --upload-roblox
 """
 
 import sys
 import argparse
+import random
+import string
 from src.downloader import get_downloader
 from src.converter import AudioConverter
 from src.filename_generator import build_filename
+from src.roblox_uploader import RobloxUploader
 from src import ui
 
 SUPPORTED_DOMAINS = (
@@ -79,6 +83,33 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable auto-splitting for long audio",
     )
+    parser.add_argument(
+        "--upload-roblox",
+        action="store_true",
+        help="Prompt to upload result to Roblox after conversion",
+    )
+    parser.add_argument(
+        "--cookies-from-browser",
+        type=str,
+        default=None,
+        help="Browser to extract cookies from (e.g. chrome, firefox, edge, brave)",
+    )
+    parser.add_argument(
+        "--cookies",
+        type=str,
+        default=None,
+        help="Path to cookies.txt file for yt-dlp",
+    )
+    parser.add_argument(
+        "--cookies-input",
+        action="store_true",
+        help="Paste cookies directly in terminal (Netscape format)",
+    )
+    parser.add_argument(
+        "--roblox-trick",
+        action="store_true",
+        help="Apply speed 2.3x + amplify -8dB trick for Roblox bypass (restore in-game with PlaybackSpeed)",
+    )
     return parser.parse_args()
 
 
@@ -91,6 +122,180 @@ def detect_source(url: str) -> str:
     if "open.spotify.com" in url_lower or "spotify.link" in url_lower:
         return "Spotify"
     return "Unknown"
+
+
+def _generate_random_name(length: int = 8) -> str:
+    """Generate random alphanumeric string untuk display name Roblox."""
+    chars = string.ascii_lowercase + string.digits
+    return ''.join(random.choices(chars, k=length))
+
+
+def _prompt_cookies_input(temp_dir: str = "temp") -> str:
+    """
+    Prompt user to paste cookies in Netscape format directly in terminal.
+    Saves to temp/cookies.txt and returns the path.
+    """
+    from pathlib import Path
+
+    print()
+    print("  ┌─────────────────────────────────────────┐")
+    print("  │         PASTE COOKIES                   │")
+    print("  └─────────────────────────────────────────┘")
+    print()
+    print("  Paste cookies (Netscape format) di bawah ini.")
+    print("  Setelah selesai, ketik 'END' di baris baru lalu Enter.")
+    print()
+
+    lines = []
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            break
+        if line.strip().upper() == "END":
+            break
+        lines.append(line)
+
+    if not lines:
+        print("  [WARN] Tidak ada cookies yang diinput. Lanjut tanpa cookies.")
+        return None
+
+    # Pastikan header Netscape ada
+    cookie_text = "\n".join(lines)
+    if "# Netscape HTTP Cookie File" not in cookie_text:
+        cookie_text = "# Netscape HTTP Cookie File\n" + cookie_text
+
+    # Save ke temp/cookies.txt
+    temp_path = Path(temp_dir)
+    temp_path.mkdir(parents=True, exist_ok=True)
+    cookies_path = temp_path / "cookies.txt"
+    cookies_path.write_text(cookie_text, encoding="utf-8")
+
+    cookie_count = sum(1 for l in lines if l.strip() and not l.startswith("#"))
+    print(f"\n  [OK] {cookie_count} cookies disimpan ke {cookies_path}")
+    print()
+
+    return str(cookies_path)
+
+
+def prompt_roblox_upload(output_paths: list[str], track_title: str, clean_filename: str = "") -> None:
+    """
+    Interactively ask user which files to upload to Roblox,
+    then collect API key + userId and upload.
+    """
+    print()
+    print("  ┌─────────────────────────────────────────┐")
+    print("  │         UPLOAD KE ROBLOX                │")
+    print("  └─────────────────────────────────────────┘")
+
+    # Show file list
+    print()
+    print("  File yang tersedia:")
+    for i, path in enumerate(output_paths, 1):
+        from pathlib import Path
+        print(f"    [{i}] {Path(path).name}")
+
+    print()
+
+    # Ask which files to upload
+    if len(output_paths) == 1:
+        choice_input = input("  Upload file ini ke Roblox? (y/n): ").strip().lower()
+        if choice_input != "y":
+            print("  [SKIP] Upload dibatalkan.")
+            return
+        selected_paths = output_paths
+    else:
+        print("  Masukkan nomor file yang mau diupload (pisah koma, atau 'all'):")
+        choice_input = input("  Pilihan: ").strip().lower()
+
+        if choice_input == "all":
+            selected_paths = output_paths
+        else:
+            try:
+                indices = [int(x.strip()) - 1 for x in choice_input.split(",")]
+                selected_paths = [output_paths[i] for i in indices if 0 <= i < len(output_paths)]
+            except (ValueError, IndexError):
+                print("  [ERR] Input tidak valid. Upload dibatalkan.")
+                return
+
+        if not selected_paths:
+            print("  [SKIP] Tidak ada file dipilih.")
+            return
+
+    # Collect credentials
+    import getpass
+    print()
+    api_key = getpass.getpass("  Masukkan Roblox API Key: ").strip()
+    if not api_key:
+        print("  [ERR] API key tidak boleh kosong.")
+        return
+
+    user_id = input("  Masukkan Roblox User ID: ").strip()
+    if not user_id:
+        print("  [ERR] User ID tidak boleh kosong.")
+        return
+
+    # Mask API key confirmation
+    masked = api_key[:6] + "*" * max(0, len(api_key) - 6)
+    print(f"  API Key  : {masked}")
+    print(f"  User ID  : {user_id}")
+
+    # Upload each selected file
+    uploader = RobloxUploader(api_key=api_key, user_id=user_id)
+
+    print()
+    print(f"  Mengupload {len(selected_paths)} file...")
+    print()
+
+    success_count = 0
+    for i, filepath in enumerate(selected_paths, 1):
+        from pathlib import Path
+
+        # FIX: Generate nama random supaya tidak bocor judul asli ke Roblox
+        random_id = _generate_random_name(8)
+        if len(selected_paths) == 1:
+            display_name = f"audio_{random_id}"
+        else:
+            display_name = f"audio_{random_id}_{i}"
+
+        print(f"  [{i}/{len(selected_paths)}] Uploading: {display_name}")
+
+        # Poll terus sampai status final (approved/rejected) — timeout 24 jam
+        result = uploader.upload(
+            filepath=filepath,
+            display_name=display_name,
+            wait_moderation=True,
+            moderation_timeout=420,  # 7 menit max tunggu moderasi
+        )
+
+        if result["success"]:
+            asset_id  = result.get("asset_id") or "N/A"
+            asset_url = result.get("asset_url") or ""
+            mod_state = result.get("moderation_state") or "Reviewing"
+            mod_note  = result.get("moderation_note")
+
+            if mod_state == "Approved":
+                success_count += 1
+                print(f"  [OK] Asset ID   : {asset_id}")
+                if asset_url:
+                    print(f"       rbxassetid  : {asset_url}")
+                print(f"       Moderasi    : [APPROVED] Siap dipakai!")
+            elif mod_state == "Rejected":
+                print(f"  [REJECTED] Asset ID : {asset_id}")
+                print(f"             Moderasi : [REJECTED] Asset ditolak Roblox.")
+                if mod_note:
+                    print(f"             Alasan   : {mod_note}")
+            else:
+                success_count += 1
+                print(f"  [?] Asset ID    : {asset_id}")
+                print(f"      Moderasi    : [REVIEWING] Cek manual di Creator Dashboard.")
+        else:
+            print(f"  [ERR] {result['error']}")
+
+    # Summary
+    print()
+    print(f"  Upload selesai: {success_count}/{len(selected_paths)} berhasil.")
+    print()
 
 
 def main() -> None:
@@ -121,11 +326,21 @@ def main() -> None:
         max_dur=max_dur,
     )
 
+    # ── Handle cookies input ──
+    cookies_file = args.cookies
+    if args.cookies_input:
+        cookies_file = _prompt_cookies_input(args.temp_dir)
+
     # ── Step 1: Download ──
     ui.print_step(1, 3, f"Downloading from {source}")
 
     try:
-        downloader = get_downloader(url, temp_dir=args.temp_dir)
+        downloader = get_downloader(
+            url,
+            temp_dir=args.temp_dir,
+            cookies_from_browser=args.cookies_from_browser,
+            cookies_file=cookies_file,
+        )
         download_result = downloader.download(url)
     except (ValueError, EnvironmentError) as e:
         ui.print_fatal(str(e))
@@ -147,6 +362,8 @@ def main() -> None:
         label += " + modifying"
     if max_dur > 0:
         label += " + auto-split"
+    if args.roblox_trick:
+        label += " + roblox-trick"
 
     ui.print_step(3, 3, label)
 
@@ -159,6 +376,7 @@ def main() -> None:
             modify=modify,
             intensity=args.intensity,
             max_duration=max_dur,
+            roblox_trick=args.roblox_trick,
         )
     except (FileNotFoundError, RuntimeError) as e:
         ui.print_fatal(str(e))
@@ -172,6 +390,24 @@ def main() -> None:
 
     # ── Results ──
     ui.print_results(output_paths)
+
+    # ── Roblox trick restore info ──
+    if args.roblox_trick:
+        print()
+        print("  ┌─────────────────────────────────────────────────────┐")
+        print("  │  ROBLOX TRICK — RESTORE DI GAME:                   │")
+        print("  │                                                     │")
+        print("  │  sound.PlaybackSpeed = 0.4348  -- (1 / 2.3)        │")
+        print("  │  sound.Volume        = 2.5     -- boost volume back │")
+        print("  │                                                     │")
+        print("  │  Audio akan terdengar normal di dalam game.         │")
+        print("  └─────────────────────────────────────────────────────┘")
+        print()
+
+    # ── Step 4: Upload ke Roblox (manual prompt) ──
+    if args.upload_roblox:
+        prompt_roblox_upload(output_paths, title, clean_filename=output_filename)
+
     ui.print_done()
 
 
