@@ -88,6 +88,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Prompt to upload result to Roblox after conversion",
     )
+    parser.add_argument(
+        "--cookies-from-browser",
+        type=str,
+        default=None,
+        help="Browser to extract cookies from (e.g. chrome, firefox, edge, brave)",
+    )
+    parser.add_argument(
+        "--cookies",
+        type=str,
+        default=None,
+        help="Path to cookies.txt file for yt-dlp",
+    )
     return parser.parse_args()
 
 
@@ -195,7 +207,7 @@ def prompt_roblox_upload(output_paths: list[str], track_title: str, clean_filena
             filepath=filepath,
             display_name=display_name,
             wait_moderation=True,
-            moderation_timeout=86400,
+            moderation_timeout=420,  # 7 menit max tunggu moderasi
         )
 
         if result["success"]:
@@ -260,7 +272,12 @@ def main() -> None:
     ui.print_step(1, 3, f"Downloading from {source}")
 
     try:
-        downloader = get_downloader(url, temp_dir=args.temp_dir)
+        downloader = get_downloader(
+            url,
+            temp_dir=args.temp_dir,
+            cookies_from_browser=args.cookies_from_browser,
+            cookies_file=args.cookies,
+        )
         download_result = downloader.download(url)
     except (ValueError, EnvironmentError) as e:
         ui.print_fatal(str(e))
