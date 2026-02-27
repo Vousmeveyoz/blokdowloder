@@ -79,23 +79,6 @@ class BaseDownloader:
 class YtdlpDownloader(BaseDownloader):
     """Downloads audio from SoundCloud and YouTube URLs using yt-dlp."""
 
-    def __init__(
-        self,
-        temp_dir: str = "temp",
-        cookies_from_browser: Optional[str] = None,
-        cookies_file: Optional[str] = None,
-    ):
-        """
-        Args:
-            temp_dir:             Directory for downloaded files.
-            cookies_from_browser: Browser name to extract cookies from
-                                  (e.g. 'chrome', 'firefox', 'edge', 'brave').
-            cookies_file:         Path to cookies.txt file.
-        """
-        super().__init__(temp_dir)
-        self.cookies_from_browser = cookies_from_browser
-        self.cookies_file = cookies_file
-
     def _progress_hook(self, d: dict) -> None:
         """Display live download progress in terminal."""
         try:
@@ -135,7 +118,7 @@ class YtdlpDownloader(BaseDownloader):
         before_files = set(self.temp_dir.glob("*.mp3"))
 
         ydl_opts = {
-            "format": "ba/b",  # ba = best audio only, b = best (any)
+            "format": "bestaudio/best",
             "outtmpl": str(self.temp_dir / "%(title)s.%(ext)s"),
             "restrictfilenames": False,
             "windowsfilenames": True,
@@ -151,12 +134,6 @@ class YtdlpDownloader(BaseDownloader):
             ],
         }
 
-        # Tambahkan cookies support untuk bypass YouTube bot detection
-        if self.cookies_from_browser:
-            ydl_opts["cookiesfrombrowser"] = (self.cookies_from_browser,)
-        elif self.cookies_file:
-            ydl_opts["cookiefile"] = self.cookies_file
-
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
@@ -169,30 +146,16 @@ class YtdlpDownloader(BaseDownloader):
                     "view_count": info.get("view_count"),
                 }
         except yt_dlp.utils.DownloadError as e:
-            error_msg = str(e)
-            # Berikan hint yang jelas kalau kena bot detection
-            if "Sign in to confirm" in error_msg or "bot" in error_msg.lower():
-                raise ValueError(
-                    "YouTube mendeteksi bot. Coba jalankan dengan cookies:\n\n"
-                    "  python main.py <url> --cookies-from-browser chrome\n\n"
-                    "Browser yang didukung: chrome, firefox, edge, brave, opera, vivaldi\n"
-                    "Pastikan kamu sudah login YouTube di browser tersebut."
-                )
             raise ValueError(f"Gagal download: {e}")
 
         after_files = set(self.temp_dir.glob("*.mp3"))
         new_files = after_files - before_files
 
         if not new_files:
-            # Fallback: ambil file MP3 paling baru di temp dir
-            all_mp3 = list(self.temp_dir.glob("*.mp3"))
-            if not all_mp3:
-                raise ValueError(
-                    "Download selesai tapi file MP3 tidak ditemukan di folder temp. "
-                    "Pastikan ffmpeg terinstall dengan benar."
-                )
-            # Gunakan file yang paling baru dimodifikasi
-            new_files = {max(all_mp3, key=lambda f: f.stat().st_mtime)}
+            raise ValueError(
+                "Download selesai tapi file MP3 tidak ditemukan di folder temp. "
+                "Pastikan ffmpeg terinstall dengan benar."
+            )
 
         downloaded_file = max(new_files, key=lambda f: f.stat().st_mtime)
 
@@ -479,19 +442,15 @@ def get_downloader(
     temp_dir: str = "temp",
     spotify_bitrate: str = "192k",
     spotify_format: str = "mp3",
-    cookies_from_browser: Optional[str] = None,
-    cookies_file: Optional[str] = None,
 ) -> BaseDownloader:
     """
     Return the appropriate downloader based on URL.
 
     Args:
-        url:                  Track URL
-        temp_dir:             Temporary directory for downloads
-        spotify_bitrate:      Bitrate for Spotify downloads (default '192k')
-        spotify_format:       Audio format for Spotify downloads (default 'mp3')
-        cookies_from_browser: Browser name for cookie extraction (YouTube)
-        cookies_file:         Path to cookies.txt file (YouTube)
+        url:              Track URL
+        temp_dir:         Temporary directory for downloads
+        spotify_bitrate:  Bitrate for Spotify downloads (default '192k')
+        spotify_format:   Audio format for Spotify downloads (default 'mp3')
 
     Returns:
         BaseDownloader instance (YtdlpDownloader or SpotifyDownloader)
@@ -509,13 +468,7 @@ def get_downloader(
         )
 
     if any(domain in url_lower for domain in ("soundcloud.com", "youtube.com", "youtu.be")):
-        # Cookies only needed for YouTube, but harmless for SoundCloud
-        is_youtube = "youtube.com" in url_lower or "youtu.be" in url_lower
-        return YtdlpDownloader(
-            temp_dir=temp_dir,
-            cookies_from_browser=cookies_from_browser if is_youtube else None,
-            cookies_file=cookies_file if is_youtube else None,
-        )
+        return YtdlpDownloader(temp_dir=temp_dir)
 
     raise ValueError(
         "URL tidak didukung.\n"
