@@ -100,6 +100,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Path to cookies.txt file for yt-dlp",
     )
+    parser.add_argument(
+        "--cookies-input",
+        action="store_true",
+        help="Paste cookies directly in terminal (Netscape format)",
+    )
     return parser.parse_args()
 
 
@@ -118,6 +123,54 @@ def _generate_random_name(length: int = 8) -> str:
     """Generate random alphanumeric string untuk display name Roblox."""
     chars = string.ascii_lowercase + string.digits
     return ''.join(random.choices(chars, k=length))
+
+
+def _prompt_cookies_input(temp_dir: str = "temp") -> str:
+    """
+    Prompt user to paste cookies in Netscape format directly in terminal.
+    Saves to temp/cookies.txt and returns the path.
+    """
+    from pathlib import Path
+
+    print()
+    print("  ┌─────────────────────────────────────────┐")
+    print("  │         PASTE COOKIES                   │")
+    print("  └─────────────────────────────────────────┘")
+    print()
+    print("  Paste cookies (Netscape format) di bawah ini.")
+    print("  Setelah selesai, ketik 'END' di baris baru lalu Enter.")
+    print()
+
+    lines = []
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            break
+        if line.strip().upper() == "END":
+            break
+        lines.append(line)
+
+    if not lines:
+        print("  [WARN] Tidak ada cookies yang diinput. Lanjut tanpa cookies.")
+        return None
+
+    # Pastikan header Netscape ada
+    cookie_text = "\n".join(lines)
+    if "# Netscape HTTP Cookie File" not in cookie_text:
+        cookie_text = "# Netscape HTTP Cookie File\n" + cookie_text
+
+    # Save ke temp/cookies.txt
+    temp_path = Path(temp_dir)
+    temp_path.mkdir(parents=True, exist_ok=True)
+    cookies_path = temp_path / "cookies.txt"
+    cookies_path.write_text(cookie_text, encoding="utf-8")
+
+    cookie_count = sum(1 for l in lines if l.strip() and not l.startswith("#"))
+    print(f"\n  [OK] {cookie_count} cookies disimpan ke {cookies_path}")
+    print()
+
+    return str(cookies_path)
 
 
 def prompt_roblox_upload(output_paths: list[str], track_title: str, clean_filename: str = "") -> None:
@@ -268,6 +321,11 @@ def main() -> None:
         max_dur=max_dur,
     )
 
+    # ── Handle cookies input ──
+    cookies_file = args.cookies
+    if args.cookies_input:
+        cookies_file = _prompt_cookies_input(args.temp_dir)
+
     # ── Step 1: Download ──
     ui.print_step(1, 3, f"Downloading from {source}")
 
@@ -276,7 +334,7 @@ def main() -> None:
             url,
             temp_dir=args.temp_dir,
             cookies_from_browser=args.cookies_from_browser,
-            cookies_file=args.cookies,
+            cookies_file=cookies_file,
         )
         download_result = downloader.download(url)
     except (ValueError, EnvironmentError) as e:
