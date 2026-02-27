@@ -648,15 +648,20 @@ class AudioModifier:
         profile: ModificationProfile | None = None,
         codec: str = "libvorbis",
         quality: str = "4",
+        roblox_trick: bool = False,
     ) -> str:
         """
         Apply all audio modifications and save to output file.
         Optimized for Roblox content detection bypass.
 
+        If roblox_trick=True, applies speed 2.3x + volume -8dB as final step.
+        Restore in Roblox game with: sound.PlaybackSpeed = 0.4348
+
         Full pipeline:
           Pass 1: All filter tweaks + noise injection → intermediate WAV
           Pass 2: Micro-cuts → intermediate WAV
-          Pass 3: Silence padding → final OGG
+          Pass 3: Silence padding → intermediate WAV
+          Pass 4: Roblox trick (speed 2.3x + vol -8dB) → final OGG
         """
         input_file = Path(input_path)
         if not input_file.exists():
@@ -748,6 +753,25 @@ class AudioModifier:
                     quality="4",
                 )
                 current_input = tmp3_path
+
+            # ── Pass 4: Roblox trick (speed 2.3x + volume -8dB) ──
+            if roblox_trick:
+                tmp4 = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                tmp4_path = tmp4.name
+                tmp4.close()
+                temp_files.append(tmp4_path)
+
+                # atempo max = 2.0, jadi chain 2x: atempo=2.0,atempo=1.15 = 2.3x
+                trick_filter = "atempo=2.0,atempo=1.15,volume=-8dB"
+                cmd_trick = [
+                    "ffmpeg", "-i", current_input,
+                    "-af", trick_filter,
+                    "-map_metadata", "-1",
+                    "-c:a", "pcm_s16le",
+                    "-y", tmp4_path,
+                ]
+                self._run_ffmpeg(cmd_trick)
+                current_input = tmp4_path
 
             # ── Final encode to OGG ──
             cmd_final = [
