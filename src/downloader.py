@@ -135,7 +135,7 @@ class YtdlpDownloader(BaseDownloader):
         before_files = set(self.temp_dir.glob("*.mp3"))
 
         ydl_opts = {
-            "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+            "format": "ba/b",  # ba = best audio only, b = best (any)
             "outtmpl": str(self.temp_dir / "%(title)s.%(ext)s"),
             "restrictfilenames": False,
             "windowsfilenames": True,
@@ -509,10 +509,12 @@ def get_downloader(
         )
 
     if any(domain in url_lower for domain in ("soundcloud.com", "youtube.com", "youtu.be")):
+        # Cookies only needed for YouTube, but harmless for SoundCloud
+        is_youtube = "youtube.com" in url_lower or "youtu.be" in url_lower
         return YtdlpDownloader(
             temp_dir=temp_dir,
-            cookies_from_browser=cookies_from_browser,
-            cookies_file=cookies_file,
+            cookies_from_browser=cookies_from_browser if is_youtube else None,
+            cookies_file=cookies_file if is_youtube else None,
         )
 
     raise ValueError(
