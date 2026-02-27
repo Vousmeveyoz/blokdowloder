@@ -105,6 +105,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Paste cookies directly in terminal (Netscape format)",
     )
+    parser.add_argument(
+        "--roblox-trick",
+        action="store_true",
+        help="Apply speed 2.3x + amplify -8dB trick for Roblox bypass (restore in-game with PlaybackSpeed)",
+    )
     return parser.parse_args()
 
 
@@ -321,10 +326,15 @@ def main() -> None:
         max_dur=max_dur,
     )
 
-    # ── Handle cookies input ──
-    cookies_file = args.cookies
-    if args.cookies_input:
-        cookies_file = _prompt_cookies_input(args.temp_dir)
+    # ── Handle cookies input (YouTube only) ──
+    cookies_file = None
+    cookies_from_browser = None
+
+    if source == "YouTube":
+        cookies_file = args.cookies
+        cookies_from_browser = args.cookies_from_browser
+        if args.cookies_input:
+            cookies_file = _prompt_cookies_input(args.temp_dir)
 
     # ── Step 1: Download ──
     ui.print_step(1, 3, f"Downloading from {source}")
@@ -333,7 +343,7 @@ def main() -> None:
         downloader = get_downloader(
             url,
             temp_dir=args.temp_dir,
-            cookies_from_browser=args.cookies_from_browser,
+            cookies_from_browser=cookies_from_browser,
             cookies_file=cookies_file,
         )
         download_result = downloader.download(url)
@@ -357,6 +367,8 @@ def main() -> None:
         label += " + modifying"
     if max_dur > 0:
         label += " + auto-split"
+    if args.roblox_trick:
+        label += " + roblox-trick"
 
     ui.print_step(3, 3, label)
 
@@ -369,6 +381,7 @@ def main() -> None:
             modify=modify,
             intensity=args.intensity,
             max_duration=max_dur,
+            roblox_trick=args.roblox_trick,
         )
     except (FileNotFoundError, RuntimeError) as e:
         ui.print_fatal(str(e))
@@ -382,6 +395,19 @@ def main() -> None:
 
     # ── Results ──
     ui.print_results(output_paths)
+
+    # ── Roblox trick restore info ──
+    if args.roblox_trick:
+        print()
+        print("  ┌─────────────────────────────────────────────────────┐")
+        print("  │  ROBLOX TRICK — RESTORE DI GAME:                   │")
+        print("  │                                                     │")
+        print("  │  sound.PlaybackSpeed = 0.4348  -- (1 / 2.3)        │")
+        print("  │  sound.Volume        = 2.5     -- boost volume back │")
+        print("  │                                                     │")
+        print("  │  Audio akan terdengar normal di dalam game.         │")
+        print("  └─────────────────────────────────────────────────────┘")
+        print()
 
     # ── Step 4: Upload ke Roblox (manual prompt) ──
     if args.upload_roblox:
