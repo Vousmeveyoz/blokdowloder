@@ -133,7 +133,7 @@ class RobloxUploader:
             "asset_id": None,
             "moderation_state": self.MODERATION_REVIEWING,
             "moderation_note": None,
-            "error": f"Timeout setelah {max_wait // 3600} jam. Cek di Creator Dashboard.",
+            "error": f"Timeout setelah {max_wait // 60} menit. Cek di Creator Dashboard.",
         }
 
     def upload(
@@ -229,8 +229,8 @@ class RobloxUploader:
                 "operation_id": operation_id,
             }
 
-        print(f"  [~] Upload diterima, menunggu moderasi Roblox...")
-        poll = self._poll_operation(operation_id, max_wait=moderation_timeout, interval=15)
+        print(f"  [~] Upload diterima, menunggu moderasi Roblox (max 7 menit)...")
+        poll = self._poll_operation(operation_id, max_wait=moderation_timeout, interval=10)
         print(" " * 70, end="\r")  # clear progress line
 
         asset_id = poll["asset_id"]
