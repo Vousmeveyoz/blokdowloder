@@ -17,6 +17,8 @@ Usage:
 
 import sys
 import argparse
+import random
+import string
 from src.downloader import get_downloader
 from src.converter import AudioConverter
 from src.filename_generator import build_filename
@@ -100,6 +102,12 @@ def detect_source(url: str) -> str:
     return "Unknown"
 
 
+def _generate_random_name(length: int = 8) -> str:
+    """Generate random alphanumeric string untuk display name Roblox."""
+    chars = string.ascii_lowercase + string.digits
+    return ''.join(random.choices(chars, k=length))
+
+
 def prompt_roblox_upload(output_paths: list[str], track_title: str, clean_filename: str = "") -> None:
     """
     Interactively ask user which files to upload to Roblox,
@@ -173,13 +181,12 @@ def prompt_roblox_upload(output_paths: list[str], track_title: str, clean_filena
     for i, filepath in enumerate(selected_paths, 1):
         from pathlib import Path
 
-        # Pakai clean_filename (sudah di-noise-clean) bukan judul asli
-        # supaya tidak kena DMCA metadata check di Roblox
-        base_name = clean_filename[:50] if clean_filename else track_title[:50]
+        # FIX: Generate nama random supaya tidak bocor judul asli ke Roblox
+        random_id = _generate_random_name(8)
         if len(selected_paths) == 1:
-            display_name = base_name[:50]
+            display_name = f"audio_{random_id}"
         else:
-            display_name = f"{base_name[:46]} {i}"
+            display_name = f"audio_{random_id}_{i}"
 
         print(f"  [{i}/{len(selected_paths)}] Uploading: {display_name}")
 
