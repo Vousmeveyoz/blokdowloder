@@ -413,6 +413,29 @@ class AudioModifier:
             raise EnvironmentError("ffmpeg tidak ditemukan di PATH.")
         if shutil.which("ffprobe") is None:
             raise EnvironmentError("ffprobe tidak ditemukan di PATH.")
+        self._ffmpeg_version = self._detect_ffmpeg_version()
+
+    def _detect_ffmpeg_version(self) -> tuple[int, ...]:
+        """Detect ffmpeg major.minor version for feature compatibility checks."""
+        try:
+            result = subprocess.run(
+                ["ffmpeg", "-version"], capture_output=True, text=True
+            )
+            # First line: "ffmpeg version N.N.N ..."
+            first_line = result.stdout.split("\n")[0]
+            version_str = first_line.split("version")[1].strip().split()[0]
+            # Handle versions like "6.1.2" or "n6.1.2"
+            version_str = version_str.lstrip("nN")
+            parts = version_str.split("-")[0].split(".")
+            return tuple(int(x) for x in parts[:3] if x.isdigit())
+        except Exception:
+            return (0, 0, 0)
+
+    def _supports_afftfilt_random(self) -> bool:
+        """afftfilt with random() requires ffmpeg >= 4.4"""
+        if len(self._ffmpeg_version) >= 2:
+            return self._ffmpeg_version >= (4, 4)
+        return False
 
     def _get_duration(self, filepath: str) -> float:
         cmd = ["ffprobe","-v","quiet","-print_format","json","-show_format",str(filepath)]
@@ -425,22 +448,39 @@ class AudioModifier:
         info = json.loads(result.stdout)
         return int(info["streams"][0].get("channels", 2)) if info.get("streams") else 2
 
+    def _get_sample_rate(self, filepath: str) -> int:
+        """Get actual sample rate of input file."""
+        cmd = ["ffprobe","-v","quiet","-print_format","json","-show_streams","-select_streams","a:0",str(filepath)]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        info = json.loads(result.stdout)
+        if info.get("streams"):
+            return int(info["streams"][0].get("sample_rate", 44100))
+        return 44100
+
     def _run_ffmpeg(self, command: list[str]) -> None:
+        """Run ffmpeg command with full stderr capture for debugging."""
         try:
-            subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            result = subprocess.run(
+                command, check=True, capture_output=True, text=True
+            )
         except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"ffmpeg error: {e}")
+            # Show the last 800 chars of stderr for useful diagnostics
+            stderr_tail = (e.stderr or "")[-800:]
+            raise RuntimeError(
+                f"ffmpeg failed (exit {e.returncode}):\n{stderr_tail}"
+            )
 
     # ── Silence padding ───────────────────────────────────────────────────────
 
     def _apply_silence_padding(self, input_path: str, output_path: str,
-                                pad_start_ms: int, pad_end_ms: int, channels: int = 2) -> None:
+                                pad_start_ms: int, pad_end_ms: int,
+                                channels: int = 2, sample_rate: int = 44100) -> None:
         ch_layout = "stereo" if channels >= 2 else "mono"
         start_s = pad_start_ms / 1000.0
         end_s   = pad_end_ms   / 1000.0
         filter_complex = (
-            f"anullsrc=r=44100:cl={ch_layout}:d={start_s}[s];"
-            f"anullsrc=r=44100:cl={ch_layout}:d={end_s}[e];"
+            f"anullsrc=r={sample_rate}:cl={ch_layout}:d={start_s}[s];"
+            f"anullsrc=r={sample_rate}:cl={ch_layout}:d={end_s}[e];"
             f"[s][0:a][e]concat=n=3:v=0:a=1[out]"
         )
         self._run_ffmpeg([
@@ -457,9 +497,11 @@ class AudioModifier:
     def _apply_bit_dither(self, input_path: str, output_path: str) -> None:
         """Resample 44100 → 22050 → 44100 with triangular dithering.
         Introduces quantization noise at a different level, altering noise floor."""
+        sample_rate = self._get_sample_rate(input_path)
+        half_rate = sample_rate // 2
         self._run_ffmpeg([
             "ffmpeg", "-i", str(input_path),
-            "-af", "aresample=22050:dither_method=triangular,aresample=44100:dither_method=triangular_hp",
+            "-af", f"aresample={half_rate}:dither_method=triangular,aresample={sample_rate}:dither_method=triangular_hp",
             "-map_metadata", "-1",
             "-c:a", "pcm_s16le",
             "-y", str(output_path),
@@ -467,7 +509,8 @@ class AudioModifier:
 
     # ── Filter chain builder ──────────────────────────────────────────────────
 
-    def _build_filter_chain(self, profile: ModificationProfile, channels: int = 2) -> str:
+    def _build_filter_chain(self, profile: ModificationProfile,
+                            channels: int = 2, sample_rate: int = 44100) -> str:
         filters = []
 
         # ── Layer 2: Watermark removal ──
@@ -475,22 +518,21 @@ class AudioModifier:
             filters.append(f"lowpass=f={profile.watermark_cutoff_hz}:p=2")
 
         # ── Layer 5: Spectral blurring ──
-        # Micro-randomize FFT real/imag bins — breaks spectral fingerprint
+        # Only use afftfilt with random() if ffmpeg supports it (>= 4.4)
         if profile.spectral_blur is not None:
-            s = profile.spectral_blur
-            inv = round(1 - s, 6)
-            filters.append(
-                f"afftfilt=real=re*{inv}+{s}*(random(0)-0.5)"
-                f":imag=im*{inv}+{s}*(random(1)-0.5)"
-            )
+            if self._supports_afftfilt_random():
+                s = profile.spectral_blur
+                inv = round(1 - s, 6)
+                # Use escaped single-quote-free syntax for subprocess list args
+                filters.append(
+                    f"afftfilt=real='re*{inv}+{s}*(random(0)-0.5)'"
+                    f":imag='im*{inv}+{s}*(random(1)-0.5)'"
+                )
+            # else: skip silently — ffmpeg too old for this filter
 
         # ── Layer 5: Mid-Side processing ──
-        # M = (L+R)/2, S = (L-R)/2 → adjust independently → back to L/R
         if profile.mid_side is not None and channels >= 2:
             m, s = profile.mid_side
-            # pan filter: new_L = m*(L+R)/2 + s*(L-R)/2, new_R = m*(L+R)/2 - s*(L-R)/2
-            # simplified: new_L = ((m+s)/2)*L + ((m-s)/2)*R
-            #             new_R = ((m-s)/2)*L + ((m+s)/2)*R
             a = round((m + s) / 2, 4)
             b = round((m - s) / 2, 4)
             filters.append(f"pan=stereo|c0={a}*c0+{b}*c1|c1={b}*c0+{a}*c1")
@@ -514,29 +556,39 @@ class AudioModifier:
         # ── Layer 3: Micro-dynamics ──
         if profile.micro_dynamics is not None:
             rate, depth = profile.micro_dynamics
-            filters.append(f"tremolo=f={rate}:d={depth / 100.0}")
+            # Clamp depth to valid tremolo range (0..1)
+            clamped_depth = max(0.0, min(1.0, depth / 100.0))
+            filters.append(f"tremolo=f={rate}:d={clamped_depth}")
 
         # ── Layer 4: Noise injection ──
+        # FIX: Use proper two-channel aeval without wrapping single quotes
+        # (subprocess list args don't go through shell, so no shell quoting needed)
         if profile.noise_db is not None:
             amp = 10 ** (profile.noise_db / 20.0)
-            if profile.noise_type == "pink":
-                filters.append(
-                    f"aeval='val(0)+{amp}*(random(0)-0.5)|val(1)+{amp}*(random(1)-0.5)',"
-                    f"lowpass=f=6000"
-                )
+            noise_expr_ch0 = f"val(0)+{amp}*(random(0)-0.5)"
+            noise_expr_ch1 = f"val(1)+{amp}*(random(1)-0.5)"
+            if channels >= 2:
+                aeval_expr = f"aeval={noise_expr_ch0}|{noise_expr_ch1}"
             else:
-                filters.append(
-                    f"aeval='val(0)+{amp}*(random(0)-0.5)|val(1)+{amp}*(random(1)-0.5)'"
-                )
+                aeval_expr = f"aeval={noise_expr_ch0}"
+            if profile.noise_type == "pink":
+                # Apply lowpass after noise to shape it pink
+                filters.append(aeval_expr)
+                filters.append("lowpass=f=6000")
+            else:
+                filters.append(aeval_expr)
 
         # ── Layer 5: Harmonic distortion ──
-        # Add subtle 2nd and 3rd harmonic overtones
+        # FIX: Same quoting fix as noise injection
         if profile.harmonic_distortion is not None:
             d = profile.harmonic_distortion
-            filters.append(
-                f"aeval='val(0)+{d}*sin(val(0)*6.28318)+{d*0.5}*sin(val(0)*9.42478)"
-                f"|val(1)+{d}*sin(val(1)*6.28318)+{d*0.5}*sin(val(1)*9.42478)'"
-            )
+            d2 = round(d * 0.5, 6)
+            harm_ch0 = f"val(0)+{d}*sin(val(0)*6.28318)+{d2}*sin(val(0)*9.42478)"
+            harm_ch1 = f"val(1)+{d}*sin(val(1)*6.28318)+{d2}*sin(val(1)*9.42478)"
+            if channels >= 2:
+                filters.append(f"aeval={harm_ch0}|{harm_ch1}")
+            else:
+                filters.append(f"aeval={harm_ch0}")
 
         # ── Layer 4: Subtle reverb ──
         if profile.reverb is not None:
@@ -546,9 +598,9 @@ class AudioModifier:
         # ── Layer 1: Pitch shift ──
         if profile.pitch_semitones is not None and profile.pitch_semitones != 0:
             ratio    = 2 ** (profile.pitch_semitones / 12.0)
-            new_rate = int(44100 * ratio)
+            new_rate = int(sample_rate * ratio)
             filters.append(f"asetrate={new_rate}")
-            filters.append("aresample=44100")
+            filters.append(f"aresample={sample_rate}")
 
         # ── Layer 1: Speed ──
         if profile.speed_factor is not None and profile.speed_factor != 1.0 and not profile.speed_2x:
@@ -558,12 +610,11 @@ class AudioModifier:
         if profile.time_stretch is not None and profile.time_stretch != 1.0 and not profile.speed_2x:
             factor = max(0.5, min(2.0, profile.time_stretch))
             filters.append(f"atempo={factor}")
-            # Compensate pitch back to original
-            inv_semitones = -12 * (factor - 1.0) * 0.5  # approximation
+            inv_semitones = -12 * (factor - 1.0) * 0.5
             if abs(inv_semitones) > 0.01:
                 inv_ratio = 2 ** (inv_semitones / 12.0)
-                filters.append(f"asetrate={int(44100 * inv_ratio)}")
-                filters.append("aresample=44100")
+                filters.append(f"asetrate={int(sample_rate * inv_ratio)}")
+                filters.append(f"aresample={sample_rate}")
 
         # ── Layer 1: Speed 2.3x ──
         if profile.speed_2x:
@@ -638,8 +689,9 @@ class AudioModifier:
         if profile is None:
             profile = ModificationProfile.random(intensity="subtle")
 
-        channels     = self._get_channels(str(input_file))
-        filter_chain = self._build_filter_chain(profile, channels)
+        channels    = self._get_channels(str(input_file))
+        sample_rate = self._get_sample_rate(str(input_file))
+        filter_chain = self._build_filter_chain(profile, channels, sample_rate)
         has_tweaks   = bool(filter_chain)
         has_cuts     = bool(profile.micro_cuts)
         has_padding  = bool(profile.silence_pad_ms and sum(profile.silence_pad_ms) > 0)
@@ -656,7 +708,7 @@ class AudioModifier:
                 pad_s, pad_e = profile.silence_pad_ms
                 tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
                 tmp_files.append(tmp.name); tmp.close()
-                self._apply_silence_padding(current, tmp.name, pad_s, pad_e, channels)
+                self._apply_silence_padding(current, tmp.name, pad_s, pad_e, channels, sample_rate)
                 current = tmp.name
 
             # ── Pass 1: Filter chain ──
@@ -704,7 +756,6 @@ class AudioModifier:
                     codec=codec, quality=quality,
                 )
             else:
-                # Dither only, no cuts — encode to final format
                 cmd = ["ffmpeg", "-i", current]
                 if strip:
                     cmd.extend(["-map_metadata", "-1"])
